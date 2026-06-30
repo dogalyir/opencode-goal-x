@@ -2,7 +2,27 @@ import { randomUUID } from "node:crypto";
 import { DEFAULT_BUDGET } from "./defaults";
 import { appendGoalContractLines } from "./goal-details";
 import { nonEmptyTrimmedText } from "./text";
-import type { GoalBudget, GoalRecord, GoalStatus, GoalStoreSnapshot, GoalTask } from "./types";
+import type { GoalBudget, GoalRecord, GoalStatus, GoalStoreSnapshot, GoalTask, MaybeUndefined, TaskCounts } from "./types";
+
+export interface GoalContractInput {
+  successCriteria?: string;
+  constraints?: string;
+  verificationContract?: string;
+}
+
+interface GoalContractDetails {
+  successCriteria?: string;
+  constraints?: string;
+  verificationContract?: string;
+}
+
+export interface CreateGoalInput extends GoalContractInput {
+  objective: string;
+  sessionID: string;
+  autoContinue: boolean;
+  budgetOverrides?: Partial<GoalBudget>;
+  now?: number;
+}
 
 export function nowIso(now = Date.now()): string {
   return new Date(now).toISOString();
@@ -19,20 +39,14 @@ export function createEmptyStore(now = Date.now()): GoalStoreSnapshot {
     version: 1,
     goals: [],
     focusBySession: {},
+    drafts: {},
+    executionContexts: {},
+    auditProgress: {},
     updatedAt: nowIso(now),
   };
 }
 
-export function createGoal(input: {
-  objective: string;
-  sessionID: string;
-  autoContinue: boolean;
-  budgetOverrides?: Partial<GoalBudget>;
-  successCriteria?: string;
-  constraints?: string;
-  verificationContract?: string;
-  now?: number;
-}): GoalRecord {
+export function createGoal(input: CreateGoalInput): GoalRecord {
   const createdAtMs = input.now ?? Date.now();
   const createdAt = nowIso(createdAtMs);
   const budget = mergeBudget(input.budgetOverrides);
@@ -44,9 +58,7 @@ export function createGoal(input: {
     createdAt,
     updatedAt: createdAt,
     sessionID: input.sessionID,
-    successCriteria: cleanOptionalText(input.successCriteria),
-    constraints: cleanOptionalText(input.constraints),
-    verificationContract: cleanOptionalText(input.verificationContract),
+    ...cleanGoalContractDetails(input),
     budget,
     progress: {
       continuationTurns: 0,
@@ -74,9 +86,17 @@ function mergeBudget(overrides?: Partial<GoalBudget>): GoalBudget {
   };
 }
 
-export function cleanOptionalText(value: string | undefined): string | undefined {
+export function cleanOptionalText(value: MaybeUndefined<string>): MaybeUndefined<string> {
   if (value === undefined) return undefined;
   return nonEmptyTrimmedText(value);
+}
+
+export function cleanGoalContractDetails(input: GoalContractInput): GoalContractDetails {
+  return {
+    successCriteria: cleanOptionalText(input.successCriteria),
+    constraints: cleanOptionalText(input.constraints),
+    verificationContract: cleanOptionalText(input.verificationContract),
+  };
 }
 
 export function cloneGoal(goal: GoalRecord): GoalRecord {
@@ -101,7 +121,7 @@ function cloneTask(task: GoalTask): GoalTask {
   };
 }
 
-export function focusGoal(store: GoalStoreSnapshot, sessionID: string, goalID: string | undefined): GoalStoreSnapshot {
+export function focusGoal(store: GoalStoreSnapshot, sessionID: string, goalID: MaybeUndefined<string>): GoalStoreSnapshot {
   const focusBySession = { ...store.focusBySession };
   if (goalID === undefined) {
     delete focusBySession[sessionID];
@@ -122,11 +142,11 @@ export function upsertGoal(store: GoalStoreSnapshot, goal: GoalRecord): GoalStor
     }
     goals.push(cloneGoal(current));
   }
-  if (!replaced) goals.push(cloneGoal(goal));
+  if (replaced === false) goals.push(cloneGoal(goal));
   return { ...store, goals, updatedAt: nowIso() };
 }
 
-export function focusedGoal(store: GoalStoreSnapshot, sessionID: string): GoalRecord | undefined {
+export function focusedGoal(store: GoalStoreSnapshot, sessionID: string): MaybeUndefined<GoalRecord> {
   const goalID = store.focusBySession[sessionID];
   if (goalID === undefined) return undefined;
   return store.goals.find((goal) => goal.id === goalID && isOpenGoal(goal));
@@ -136,7 +156,7 @@ export function openGoals(store: GoalStoreSnapshot): GoalRecord[] {
   return store.goals.filter(isOpenGoal).map(cloneGoal);
 }
 
-function isOpenGoal(goal: GoalRecord): boolean {
+export function isOpenGoal(goal: Pick<GoalRecord, "status">): boolean {
   return goal.status === "active" || goal.status === "paused";
 }
 
@@ -177,13 +197,13 @@ export function summarizeGoal(goal: GoalRecord): string {
   return lines.join("\n");
 }
 
-function taskSummary(goal: GoalRecord): string | undefined {
+function taskSummary(goal: GoalRecord): MaybeUndefined<string> {
   if (goal.taskList === undefined) return undefined;
   const counts = countTasks(goal.taskList.tasks);
   return `Tasks: ${counts.complete}/${counts.total} complete${counts.skipped > 0 ? `, ${counts.skipped} skipped` : ""}`;
 }
 
-export function countTasks(tasks: GoalTask[]): { total: number; complete: number; skipped: number; pending: number } {
+export function countTasks(tasks: GoalTask[]): TaskCounts {
   let total = 0;
   let complete = 0;
   let skipped = 0;
@@ -201,7 +221,7 @@ export function countTasks(tasks: GoalTask[]): { total: number; complete: number
   return { total, complete, skipped, pending: total - complete - skipped };
 }
 
-export function findTask(tasks: GoalTask[], taskID: string): GoalTask | undefined {
+export function findTask(tasks: GoalTask[], taskID: string): MaybeUndefined<GoalTask> {
   for (const task of tasks) {
     if (task.id === taskID) return task;
     if (task.subtasks === undefined) continue;
@@ -221,9 +241,15 @@ export function updateTaskTree(tasks: GoalTask[], taskID: string, updater: (task
 
 export function hasPendingBlockingTasks(goal: GoalRecord): boolean {
   if (goal.taskList === undefined) return false;
-  if (!goal.taskList.blockCompletion) return false;
+  if (goal.taskList.blockCompletion === false) return false;
   const counts = countTasks(goal.taskList.tasks);
   return counts.pending > 0;
+}
+
+export function shouldSuppressGenericCompactionAutocontinue(goal: MaybeUndefined<GoalRecord>): boolean {
+  if (goal === undefined) return false;
+  if (goal.status !== "active") return false;
+  return goal.autoContinue;
 }
 
 export function formatGoalList(store: GoalStoreSnapshot, sessionID: string): string {

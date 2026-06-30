@@ -27,9 +27,20 @@ function renderTaskLine(task: GoalTask, prefix: string, mode: TaskRenderMode): s
 }
 
 function taskMarker(task: GoalTask, mode: TaskRenderMode): string {
-  if (task.status === "complete") return mode === "prompt" ? "[x]" : "x";
-  if (task.status === "skipped") return mode === "prompt" ? "[~]" : "~";
-  return mode === "prompt" ? "[ ]" : " ";
+  if (mode === "prompt") return promptTaskMarker(task);
+  return markdownTaskMarker(task);
+}
+
+function promptTaskMarker(task: GoalTask): string {
+  if (task.status === "complete") return "[x]";
+  if (task.status === "skipped") return "[~]";
+  return "[ ]";
+}
+
+function markdownTaskMarker(task: GoalTask): string {
+  if (task.status === "complete") return "x";
+  if (task.status === "skipped") return "~";
+  return " ";
 }
 
 function markdownTaskSuffix(task: GoalTask): string {

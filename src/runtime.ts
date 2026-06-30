@@ -1,7 +1,7 @@
-import type { Event, Message } from "@opencode-ai/sdk";
 import { tool, type Config, type Hooks, type PluginInput } from "@opencode-ai/plugin";
 import { runCompletionAudit } from "./audit";
 import { parseGoalCommand } from "./commands";
+import { createGoalDraft, findSessionDraft, formatGoalDraftConfirmation, formatGoalDraftHeaderLines, removeDraft, upsertDraft } from "./draft";
 import { DEFAULT_OPTIONS, MEANINGFUL_PROGRESS_TOOLS, PLUGIN_NAME } from "./defaults";
 import { errorMessage } from "./errors";
 import {
@@ -13,26 +13,40 @@ import {
   focusedGoal,
   formatGoalList,
   hasPendingBlockingTasks,
+  isOpenGoal,
   nowIso,
   openGoals,
+  shouldSuppressGenericCompactionAutocontinue,
   summarizeGoal,
   updateGoalStatus,
   updateTaskTree,
   upsertGoal,
 } from "./goal";
+import { mergeExecutionContext, type ExecutionContextCandidate, type ExecutionModelCandidate } from "./execution-context";
+import { normalizeOpenCodeEvent, assistantMessageTokens, type OpenCodeMessageSnapshot } from "./opencode-events";
 import { auditPrompt, compactionContext, continuationPrompt, goalSystemPrompt, limitWrapUpPrompt } from "./prompts";
 import { normalizeOptions } from "./schemas";
-import { appendLedger, loadStore, resolveGoalPaths, saveStore, writeGoalMarkdown } from "./storage";
+import { buildVariantAwareTextPrompt, type VariantAwareTextPromptInput } from "./session-prompt";
+import { appendLedger, loadStore, readLedgerEvents, resolveGoalPaths, saveStore, writeGoalMarkdown } from "./storage";
+import { normalizeToolTaskList } from "./task-normalization";
+import { hasPendingSubtasks, validateTaskTree, type TaskValidationOptions } from "./task-validation";
+import { syncGoalTasksFromTodos } from "./todo-sync";
 import type {
   CommandExecutionResult,
   GoalBudget,
+  GoalDraft,
   GoalPaths,
   GoalRecord,
   GoalRuntimeOptions,
   GoalStoreSnapshot,
   GoalTask,
   GoalTaskList,
+  MaybeUndefined,
+  MutableTextPart,
   OperationResult,
+  ParsedGoalCommand,
+  SessionExecutionContext,
+  UnknownRecord,
 } from "./types";
 
 const TaskStatusInputSchema = tool.schema.enum(["pending", "complete", "skipped"]).default("pending");
@@ -46,14 +60,13 @@ const TaskInputBaseFields = {
   skipReason: tool.schema.string().min(1).optional(),
   completedAt: tool.schema.string().min(1).optional(),
   skippedAt: tool.schema.string().min(1).optional(),
+  lightweightSubtasks: tool.schema.boolean().optional(),
 };
 
-const SubtaskInputSchema = tool.schema.object(TaskInputBaseFields);
-
-const TaskInputSchema = tool.schema.object({
+const TaskInputSchema: ReturnType<typeof tool.schema.lazy> = tool.schema.lazy(() => tool.schema.object({
   ...TaskInputBaseFields,
-  subtasks: tool.schema.array(SubtaskInputSchema).optional(),
-});
+  subtasks: tool.schema.array(TaskInputSchema).optional(),
+}));
 
 const TaskListArgs = {
   tasks: tool.schema.array(TaskInputSchema).min(1),
@@ -79,19 +92,23 @@ interface FocusedTaskContext {
   taskList: GoalTaskList;
 }
 
-interface SessionTextPromptInput {
-  path: { id: string };
-  query: { directory: string };
-  body: { parts: Array<{ type: "text"; text: string }> };
-}
+type CommandContextInput = Omit<ExecutionContextCandidate, "source" | "timestamp">;
+type ChatContextInput = CommandContextInput;
+type CompactionContextInput = CommandContextInput & {
+  agent: string;
+  model: ExecutionModelCandidate;
+};
+
+type AuditRecordInput = Pick<NonNullable<GoalRecord["audit"]>, "auditorSessionID" | "model" | "variant">;
 
 export class GoalRuntime {
   private readonly input: PluginInput;
   private readonly options: GoalRuntimeOptions;
   private readonly paths: GoalPaths;
   private store: GoalStoreSnapshot;
-  private readonly continuationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly continuationTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; goalID: string }>();
   private readonly continuationInFlight = new Set<string>();
+  private readonly auditorSessionGoals = new Map<string, string>();
   private readonly lastEvaluatedContinuation = new Map<string, number>();
 
   constructor(input: PluginInput, rawOptions: unknown) {
@@ -112,7 +129,12 @@ export class GoalRuntime {
       event: async ({ event }) => {
         await this.handleEvent(event);
       },
+      "chat.message": async (input, output) => {
+        this.captureChatMessageContext(input, output.message.id);
+        this.handleUserInterruption(input.sessionID, output.message.id);
+      },
       "command.execute.before": async (input, output) => {
+        this.captureCommandExecutionContext(input);
         await this.handleCommand(input.command, input.sessionID, input.arguments, output.parts);
       },
       "experimental.chat.system.transform": async (input, output) => {
@@ -122,6 +144,7 @@ export class GoalRuntime {
         this.appendCompactionContext(input.sessionID, output.context);
       },
       "experimental.compaction.autocontinue": async (input, output) => {
+        this.captureCompactionExecutionContext(input);
         this.disableCompactionAutocontinue(input.sessionID, output);
       },
       "tool.execute.after": async (input, output) => {
@@ -132,28 +155,33 @@ export class GoalRuntime {
   }
 
   private dispose(): void {
-    for (const timer of this.continuationTimers.values()) clearTimeout(timer);
+    for (const timerState of this.continuationTimers.values()) clearTimeout(timerState.timer);
     this.continuationTimers.clear();
     this.continuationInFlight.clear();
   }
 
-  private appendGoalSystemContext(sessionID: string | undefined, system: string[]): void {
+  private appendGoalSystemContext(sessionID: MaybeUndefined<string>, system: string[]): void {
     if (sessionID === undefined) return;
-    const goal = focusedGoal(this.store, sessionID);
+    const goal = this.openFocusedGoal(sessionID);
     if (goal === undefined) return;
-    if (goal.status !== "active" && goal.status !== "paused") return;
     system.push(goalSystemPrompt(goal));
   }
 
   private appendCompactionContext(sessionID: string, context: string[]): void {
-    const goal = focusedGoal(this.store, sessionID);
+    const goal = this.openFocusedGoal(sessionID);
     if (goal === undefined) return;
-    context.push(compactionContext(goal));
+    context.push(compactionContext({
+      focusedGoal: goal,
+      openGoals: openGoals(this.store),
+      recentLedgerEvents: readLedgerEvents(this.paths, 8),
+    }));
   }
 
   private disableCompactionAutocontinue(sessionID: string, output: { enabled: boolean }): void {
+    const goal = this.autoContinuingGoal(sessionID);
+    if (shouldSuppressGenericCompactionAutocontinue(goal) === false) return;
     const queued = this.queueContinuation(sessionID, "post-compaction");
-    if (!queued) return;
+    if (queued === false) return;
     output.enabled = false;
   }
 
@@ -161,11 +189,19 @@ export class GoalRuntime {
     if (config.command === undefined) config.command = {};
     const commandName = this.options.commandName;
     config.command[commandName] = {
-      description: "Start or manage a durable opencode-goal-x objective.",
+      description: "Draft a durable opencode-goal-x objective for explicit confirmation, or manage existing goals.",
       template: "$ARGUMENTS",
     };
     config.command[`${commandName}-set`] = {
       description: "Start a durable opencode-goal-x objective immediately.",
+      template: "$ARGUMENTS",
+    };
+    config.command[`${commandName}-confirm`] = {
+      description: "Confirm the latest drafted opencode-goal-x objective and start it.",
+      template: "$ARGUMENTS",
+    };
+    config.command[`${commandName}-reject`] = {
+      description: "Discard the latest drafted opencode-goal-x objective without creating a goal.",
       template: "$ARGUMENTS",
     };
     config.command[`${commandName}-status`] = { description: "Show the focused goal status.", template: "$ARGUMENTS" };
@@ -178,10 +214,11 @@ export class GoalRuntime {
     config.command[`${commandName}-clear`] = { description: "Clear and archive the focused goal.", template: "$ARGUMENTS" };
   }
 
-  private async handleCommand(command: string, sessionID: string, rawArguments: string, parts: { type: string; text?: string }[]): Promise<void> {
-    if (!this.ownsCommand(command)) return;
+  private async handleCommand(command: string, sessionID: string, rawArguments: string, parts: MutableTextPart[]): Promise<void> {
+    if (this.ownsCommand(command) === false) return;
+    this.refreshStore();
     const parsed = parseGoalCommand(command, this.options.commandName, rawArguments);
-    if (!parsed.ok) {
+    if (parsed.ok === false) {
       this.replaceCommandText(parts, `opencode-goal-x command rejected: ${parsed.message}`);
       await this.toast(parsed.message, "error");
       return;
@@ -198,7 +235,7 @@ export class GoalRuntime {
     return command === base || command.startsWith(`${base}-`);
   }
 
-  private replaceCommandText(parts: { type: string; text?: string }[], text: string): void {
+  private replaceCommandText(parts: MutableTextPart[], text: string): void {
     for (const part of parts) {
       if (part.type !== "text") continue;
       part.text = text;
@@ -206,21 +243,32 @@ export class GoalRuntime {
     }
   }
 
-  private async executeParsedCommand(sessionID: string, command: { action: string; objective?: string; goalId?: string; reason?: string; successCriteria?: string; constraints?: string; verificationContract?: string; budgetOverrides: Partial<GoalBudget> }): Promise<CommandExecutionResult> {
+  private async executeParsedCommand(sessionID: string, command: ParsedGoalCommand): Promise<CommandExecutionResult> {
+    if (command.action === "draft") {
+      if (command.objective === undefined) return handled("Goal draft topic is empty.", false);
+      return handled(this.startGoalDraftCommand(sessionID, command), false);
+    }
+
     if (command.action === "start") {
       if (command.objective === undefined) return handled("Goal objective is empty.", false);
       const goal = createGoal({
         objective: command.objective,
         sessionID,
         autoContinue: true,
-        budgetOverrides: command.budgetOverrides,
+        budgetOverrides: this.goalBudgetOverrides(command.budgetOverrides),
         successCriteria: command.successCriteria,
         constraints: command.constraints,
         verificationContract: command.verificationContract,
       });
-      const saved = this.persistGoal(goal, sessionID, "goal_started");
-      return handled(`Goal started.\n\n${summarizeGoal(saved)}\n\nThe auto-continue loop is armed.`, true);
+      const saved = this.persistGoal(goal, sessionID, "goal_started_immediate");
+      return handled(`Goal started immediately from /${this.options.commandName}-set.\n\n${summarizeGoal(saved)}\n\nThe auto-continue loop is armed.`, true);
     }
+
+    if (command.action === "confirm") {
+      const confirmText = this.confirmGoalDraftCommand(sessionID, command.goalId);
+      return handled(confirmText, confirmText.startsWith("Goal draft confirmed."));
+    }
+    if (command.action === "reject") return handled(this.rejectGoalDraftCommand(sessionID, command.goalId), false);
 
     if (command.action === "status") {
       const goal = focusedGoal(this.store, sessionID);
@@ -250,15 +298,62 @@ export class GoalRuntime {
     return handled(helpText(this.options.commandName), false);
   }
 
-  private focusGoalCommand(sessionID: string, selector: string | undefined): string {
+  private startGoalDraftCommand(sessionID: string, command: { objective?: string; successCriteria?: string; constraints?: string; verificationContract?: string; budgetOverrides: Partial<GoalBudget> }): string {
+    if (command.objective === undefined) return "Goal draft topic is empty.";
+    const draft = createGoalDraft({
+      sessionID,
+      topic: command.objective,
+      objective: command.objective,
+      successCriteria: command.successCriteria,
+      constraints: command.constraints,
+      verificationContract: command.verificationContract,
+      budgetOverrides: this.goalBudgetOverrides(command.budgetOverrides),
+      autoContinue: true,
+      status: "planning",
+    });
+    this.persistDraft(draft, sessionID, "goal_draft_requested");
+    return [
+      "Goal drafting started. No goal has been created and no implementation should start yet.",
+      "",
+      ...formatGoalDraftHeaderLines(draft),
+      "",
+      "Discuss/refine the goal in this session, then call propose_goal_draft with the finalized objective and optional tasks.",
+      `For an immediate start without drafting, use /${this.options.commandName}-set <objective>.`,
+    ].join("\n");
+  }
+
+  private confirmGoalDraftCommand(sessionID: string, selector: MaybeUndefined<string>): string {
+    const draft = findSessionDraft(this.store.drafts, sessionID, cleanOptionalText(selector));
+    if (draft === undefined) return "No pending goal draft to confirm.";
+    if (draft.status !== "proposed") return "No finalized goal draft to confirm. Continue the discussion until the assistant calls propose_goal_draft with the finalized objective.";
+    const goal = createGoal({
+      objective: draft.objective,
+      sessionID,
+      autoContinue: draft.autoContinue,
+      budgetOverrides: this.goalBudgetOverrides(draft.budgetOverrides),
+      successCriteria: draft.successCriteria,
+      constraints: draft.constraints,
+      verificationContract: draft.verificationContract,
+    });
+    const withTasks = draft.taskList === undefined ? goal : { ...goal, taskList: draft.taskList };
+    this.removeDraftRecord(draft.id, sessionID, "goal_draft_confirmed", { goalId: goal.id });
+    const saved = this.persistGoal(withTasks, sessionID, "goal_started_from_draft");
+    return `Goal draft confirmed.\n\n${summarizeGoal(saved)}\n\nThe auto-continue loop is armed.`;
+  }
+
+  private rejectGoalDraftCommand(sessionID: string, selector: MaybeUndefined<string>): string {
+    const draft = findSessionDraft(this.store.drafts, sessionID, cleanOptionalText(selector));
+    if (draft === undefined) return "No pending goal draft to reject.";
+    this.removeDraftRecord(draft.id, sessionID, "goal_draft_rejected");
+    return `Goal draft rejected. No goal was created. Draft ID: ${draft.id}`;
+  }
+
+  private focusGoalCommand(sessionID: string, selector: MaybeUndefined<string>): string {
     const goals = openGoals(this.store);
     if (goals.length === 0) return "No open goals to focus.";
     if (selector === undefined || selector.trim().length === 0) return formatGoalList(this.store, sessionID);
     const trimmed = selector.trim();
-    const maybeIndex = Number.parseInt(trimmed, 10);
-    const goal = Number.isInteger(maybeIndex) && String(maybeIndex) === trimmed
-      ? goals[maybeIndex - 1]
-      : goals.find((candidate) => candidate.id === trimmed || candidate.id.startsWith(trimmed));
+    const goal = findOpenGoalBySelector(goals, trimmed);
     if (goal === undefined) return `No open goal matches: ${trimmed}`;
     this.store = focusGoal(this.store, sessionID, goal.id);
     saveStore(this.paths, this.store);
@@ -267,10 +362,8 @@ export class GoalRuntime {
   }
 
   private pauseFocusedGoal(sessionID: string, reason: string, stopReason: "user" | "agent"): string {
-    const goalContext = this.focusedGoalContext(sessionID);
-    if (!goalContext.ok) return goalContext.message;
-    const goal = goalContext.value;
-    if (goal.status !== "active") return `Goal is not active. Current status: ${goal.status}`;
+    const goal = this.activeGoalOrMessage(sessionID);
+    if (typeof goal === "string") return goal;
     const next = updateGoalStatus(goal, "paused", {
       autoContinue: false,
       stopReason,
@@ -302,10 +395,8 @@ export class GoalRuntime {
   }
 
   private tweakFocusedGoal(sessionID: string, objective: string): string {
-    const goalContext = this.focusedGoalContext(sessionID);
-    if (!goalContext.ok) return goalContext.message;
-    const goal = goalContext.value;
-    if (goal.status !== "active" && goal.status !== "paused") return `Cannot tweak a ${goal.status} goal.`;
+    const goal = this.openLifecycleGoalOrMessage(sessionID, "tweak");
+    if (typeof goal === "string") return goal;
     const next = this.restartGoalRun(sessionID, goal, { objective: objective.trim() }, "goal_tweaked");
     return `Goal revised.\n\n${summarizeGoal(next)}`;
   }
@@ -322,9 +413,8 @@ export class GoalRuntime {
   }
 
   private abortFocusedGoal(sessionID: string, reason: string): string {
-    const goalContext = this.focusedGoalContext(sessionID);
-    if (!goalContext.ok) return goalContext.message;
-    const goal = goalContext.value;
+    const goal = this.focusedGoalOrMessage(sessionID);
+    if (typeof goal === "string") return goal;
     const next = updateGoalStatus(goal, "aborted", {
       autoContinue: false,
       stopReason: "user",
@@ -335,43 +425,157 @@ export class GoalRuntime {
   }
 
   private noGoalText(): string {
-    return `No focused goal. Use /${this.options.commandName} <objective> to start one.`;
+    return `No focused goal. Use /${this.options.commandName} <topic> to draft one, or /${this.options.commandName}-set <objective> to start immediately.`;
   }
 
   private persistGoal(goal: GoalRecord, sessionID: string, eventType: string): GoalRecord {
+    this.refreshStore();
     const saved = writeGoalMarkdown(this.paths, { ...cloneGoal(goal), updatedAt: nowIso() });
     this.store = upsertGoal(this.store, saved);
+    if (saved.auditProgress !== undefined) this.mergeAuditProgress(saved.id, saved.auditProgress);
     if (saved.status === "active" || saved.status === "paused") this.store = focusGoal(this.store, sessionID, saved.id);
     saveStore(this.paths, this.store);
     appendLedger(this.paths, { type: eventType, goalId: saved.id, sessionID, status: saved.status });
     return saved;
   }
 
-  private async handleEvent(event: Event): Promise<void> {
-    if (event.type === "session.idle") {
-      await this.handleIdle(event.properties.sessionID);
-      return;
-    }
-    if (event.type === "session.compacted") {
-      this.queueContinuation(event.properties.sessionID, "compacted");
-      return;
-    }
-    if (event.type === "message.updated") {
-      this.trackAssistantMessage(event.properties.info);
-    }
+  private persistDraft(draft: GoalDraft, sessionID: string, eventType: string): void {
+    this.store = { ...this.store, drafts: upsertDraft(this.store.drafts, draft), updatedAt: nowIso() };
+    saveStore(this.paths, this.store);
+    appendLedger(this.paths, { type: eventType, draftId: draft.id, sessionID });
   }
 
-  private trackAssistantMessage(message: Message): void {
-    if (message.role !== "assistant") return;
+  private removeDraftRecord(draftID: string, sessionID: string, eventType: string, extra: UnknownRecord = {}): void {
+    this.store = { ...this.store, drafts: removeDraft(this.store.drafts, draftID), updatedAt: nowIso() };
+    saveStore(this.paths, this.store);
+    appendLedger(this.paths, { type: eventType, draftId: draftID, sessionID, ...extra });
+  }
+
+  private refreshStore(): void {
+    this.store = loadStore(this.paths);
+  }
+
+  private mergeAuditProgress(goalID: string, auditProgress: NonNullable<GoalRecord["auditProgress"]>): void {
+    this.store = {
+      ...this.store,
+      auditProgress: {
+        ...this.store.auditProgress,
+        [goalID]: auditProgress,
+      },
+      updatedAt: nowIso(),
+    };
+  }
+
+  private async handleEvent(event: unknown): Promise<void> {
+    this.refreshStore();
+    const normalizedEvent = normalizeOpenCodeEvent(event);
+    if (normalizedEvent.ok === false) {
+      await this.log("debug", "Ignored malformed OpenCode event payload.", { reason: normalizedEvent.message });
+      return;
+    }
+
+    const openCodeEvent = normalizedEvent.value;
+    if (openCodeEvent.type === "session.idle") {
+      await this.handleIdle(openCodeEvent.sessionID);
+      return;
+    }
+    if (openCodeEvent.type === "session.compacted") {
+      this.queueContinuation(openCodeEvent.sessionID, "compacted");
+      return;
+    }
+    if (openCodeEvent.type === "message.updated") {
+      this.captureMessageExecutionContext(openCodeEvent.info);
+      this.trackAssistantMessage(openCodeEvent.info);
+      return;
+    }
+    this.syncTodos(openCodeEvent.sessionID, openCodeEvent.todos);
+  }
+
+  private captureCommandExecutionContext(input: CommandContextInput): void {
+    this.recordExecutionContext({ ...input, source: "command.execute.before" });
+  }
+
+  private captureChatMessageContext(input: ChatContextInput, messageID: string): void {
+    this.recordExecutionContext({ ...input, messageID, source: "chat.message" });
+  }
+
+  private captureCompactionExecutionContext(input: CompactionContextInput): void {
+    this.recordExecutionContext({ ...input, source: "compaction.autocontinue" });
+  }
+
+  private captureMessageExecutionContext(message: OpenCodeMessageSnapshot): void {
+    if (message.role !== "user") return;
+    this.recordExecutionContext({
+      sessionID: message.sessionID,
+      agent: message.agent,
+      model: message.model,
+      messageID: message.id,
+      source: "message.updated",
+      timestamp: message.time.created,
+    });
+  }
+
+  private recordExecutionContext(input: CommandContextInput & { source: SessionExecutionContext["source"]; timestamp?: number }): void {
+    const existing = this.executionContextFor(input.sessionID);
+    const next = mergeExecutionContext(existing, input);
+    this.store = {
+      ...this.store,
+      executionContexts: {
+        ...this.store.executionContexts,
+        [input.sessionID]: next,
+      },
+      updatedAt: nowIso(),
+    };
+    saveStore(this.paths, this.store);
+    appendLedger(this.paths, { type: "goal_context_captured", sessionID: input.sessionID, source: input.source, agent: next.agent, model: next.modelID, variant: next.variant });
+  }
+
+  private executionContextFor(sessionID: string): MaybeUndefined<SessionExecutionContext> {
+    const contexts = this.store.executionContexts;
+    if (contexts === undefined) return undefined;
+    return contexts[sessionID];
+  }
+
+  private handleUserInterruption(sessionID: string, messageID: string): void {
+    if (this.continuationTimers.has(sessionID) === false && this.continuationInFlight.has(sessionID) === false) return;
+    const goal = this.autoContinuingGoal(sessionID);
+    if (goal === undefined) return;
+    const next = updateGoalStatus(goal, "paused", {
+      autoContinue: false,
+      stopReason: "user",
+      pauseReason: `User message ${messageID} interrupted the auto-continue loop.`,
+    });
+    this.persistGoal(next, sessionID, "goal_user_interrupted");
+    this.clearContinuation(sessionID);
+    appendLedger(this.paths, { type: "goal_user_interruption_detail", goalId: goal.id, sessionID, messageID });
+  }
+
+  private syncTodos(sessionID: string, todos: unknown): void {
+    if (this.options.todoSync === false) return;
+    const goal = focusedGoal(this.store, sessionID);
+    if (goal === undefined) return;
+    const result = syncGoalTasksFromTodos(goal, todos);
+    if (result.validationError !== undefined) {
+      appendLedger(this.paths, { type: "goal_todo_sync_rejected", goalId: goal.id, sessionID, reason: result.validationError });
+      return;
+    }
+    if (result.updates.length === 0) return;
+    this.persistGoal(result.goal, sessionID, "goal_todo_synced");
+    appendLedger(this.paths, { type: "goal_todo_sync_detail", goalId: goal.id, sessionID, updates: result.updates });
+  }
+
+  private trackAssistantMessage(message: OpenCodeMessageSnapshot): void {
+    const tokens = assistantMessageTokens(message);
+    if (tokens === undefined) return;
     const goal = this.activeFocusedGoal(message.sessionID);
     if (goal === undefined) return;
-    const tokenTotal = message.tokens.input + message.tokens.output + message.tokens.reasoning;
+    const tokenTotal = tokens.input + tokens.output + tokens.reasoning;
     const next = {
       ...goal,
       progress: {
         ...goal.progress,
         tokensUsed: Math.max(goal.progress.tokensUsed, tokenTotal),
-        lastAssistantOutputTokens: message.tokens.output,
+        lastAssistantOutputTokens: tokens.output,
       },
       updatedAt: nowIso(),
     };
@@ -381,7 +585,7 @@ export class GoalRuntime {
   private trackToolExecution(sessionID: string, toolName: string, toolOutput: string): void {
     const goal = this.activeFocusedGoal(sessionID);
     if (goal === undefined) return;
-    if (!MEANINGFUL_PROGRESS_TOOLS.has(toolName)) return;
+    if (MEANINGFUL_PROGRESS_TOOLS.has(toolName) === false) return;
     const checkpoint = toolOutput.trim().slice(0, 800);
     const next = {
       ...goal,
@@ -427,7 +631,7 @@ export class GoalRuntime {
     return this.persistGoal(next, sessionID, "goal_guard_accounted");
   }
 
-  private guardReason(goal: GoalRecord): string | undefined {
+  private guardReason(goal: GoalRecord): MaybeUndefined<string> {
     if (goal.progress.continuationTurns >= goal.budget.maxTurns) return `maximum continuation turns reached (${goal.budget.maxTurns})`;
     if (Date.now() - goal.progress.startedAt >= goal.budget.maxRuntimeMs) return `maximum runtime reached (${goal.budget.maxRuntimeMs}ms)`;
     if (goal.progress.tokensUsed >= goal.budget.maxTokens) return `maximum tracked tokens reached (${goal.budget.maxTokens})`;
@@ -448,23 +652,28 @@ export class GoalRuntime {
     const delay = Math.max(0, goal.budget.minDelayMs - elapsed);
     const timer = setTimeout(() => {
       this.continuationTimers.delete(sessionID);
-      void this.sendContinuation(sessionID, reason);
+      this.runBackgroundTask(this.sendContinuation(sessionID, reason, goal.id), "Goal continuation failed unexpectedly.", { goalId: goal.id, sessionID, reason });
     }, delay);
     if (typeof timer.unref === "function") timer.unref();
-    this.continuationTimers.set(sessionID, timer);
+    this.continuationTimers.set(sessionID, { timer, goalID: goal.id });
+    appendLedger(this.paths, { type: "goal_continuation_scheduled", goalId: goal.id, sessionID, reason, delay });
     return true;
   }
 
   private clearContinuation(sessionID: string): void {
-    const timer = this.continuationTimers.get(sessionID);
-    if (timer !== undefined) clearTimeout(timer);
+    const timerState = this.continuationTimers.get(sessionID);
+    if (timerState !== undefined) clearTimeout(timerState.timer);
     this.continuationTimers.delete(sessionID);
     this.continuationInFlight.delete(sessionID);
   }
 
-  private async sendContinuation(sessionID: string, reason: string): Promise<void> {
+  private async sendContinuation(sessionID: string, reason: string, expectedGoalID: string): Promise<void> {
     const goal = this.autoContinuingGoal(sessionID);
     if (goal === undefined) return;
+    if (goal.id !== expectedGoalID) {
+      appendLedger(this.paths, { type: "goal_stale_continuation_ignored", expectedGoalID, actualGoalID: goal.id, sessionID, reason });
+      return;
+    }
     this.continuationInFlight.add(sessionID);
     const next = this.persistGoal({
       ...goal,
@@ -512,10 +721,10 @@ export class GoalRuntime {
       },
       updatedAt: nowIso(),
     }, sessionID, "goal_prompt_failed");
-    void this.log("warn", `Goal continuation prompt failed: ${message}`, { goalId: goal.id, sessionID });
+    this.runBackgroundTask(this.log("warn", `Goal continuation prompt failed: ${message}`, { goalId: goal.id, sessionID }), "Goal continuation failure logging failed.", { goalId: goal.id, sessionID });
     const guardReason = this.guardReason(next);
     if (guardReason === undefined) return;
-    void this.pauseForLimit(sessionID, next, guardReason);
+    this.runBackgroundTask(this.pauseForLimit(sessionID, next, guardReason), "Goal limit pause failed unexpectedly.", { goalId: next.id, sessionID, guardReason });
   }
 
   private async pauseForLimit(sessionID: string, goal: GoalRecord, reason: string): Promise<void> {
@@ -540,39 +749,54 @@ export class GoalRuntime {
         description: "Read the focused opencode-goal-x goal, lifecycle state, budgets, tasks, and verification contract.",
         args: {},
         execute: async (_args, context) => {
-          const goalContext = this.focusedGoalContext(context.sessionID);
-          if (!goalContext.ok) return goalContext.message;
-          return summarizeGoal(goalContext.value);
+          const goal = this.focusedGoalOrMessage(context.sessionID);
+          if (typeof goal === "string") return goal;
+          return summarizeGoal(goal);
         },
       }),
       propose_goal_draft: tool({
-        description: "Propose or create a durable goal. Only create when the user explicitly asked to start this exact goal.",
+        description: "Present a finalized goal draft for explicit user confirmation. This never creates or starts a goal by itself.",
         args: {
           objective: tool.schema.string().min(1),
           successCriteria: tool.schema.string().min(1).optional(),
           constraints: tool.schema.string().min(1).optional(),
           verificationContract: tool.schema.string().min(1).optional(),
-          confirmUserIntent: tool.schema.boolean().describe("Set true only when the user explicitly asked to start this exact goal now."),
+          autoContinue: tool.schema.boolean().optional(),
+          tasks: tool.schema.array(TaskInputSchema).optional(),
+          blockCompletion: tool.schema.boolean().optional(),
+          confirmUserIntent: tool.schema.boolean().optional().describe("Deprecated compatibility field ignored by opencode-goal-x; use /goal-confirm for confirmation."),
         },
         execute: async (args, context) => {
-          if (!args.confirmUserIntent) {
-            return [
-              "Goal draft ready. Ask the user to confirm or run /goal-set with this objective.",
-              "",
-              args.objective,
-            ].join("\n");
+          this.refreshStore();
+          const parsedTasks = args.tasks === undefined ? undefined : taskListInputSchema.safeParse({ tasks: args.tasks, blockCompletion: args.blockCompletion });
+          if (parsedTasks !== undefined && !parsedTasks.success) return "Goal draft rejected: invalid task shape.";
+          const normalizedTasks = parsedTasks === undefined ? undefined : normalizeToolTaskList(parsedTasks.data.tasks);
+          if (normalizedTasks !== undefined && !normalizedTasks.ok) return normalizedTasks.message;
+          const taskList = parsedTasks === undefined || normalizedTasks === undefined
+            ? undefined
+            : {
+                tasks: normalizedTasks.value,
+                blockCompletion: parsedTasks.data.blockCompletion ?? true,
+                proposedAt: nowIso(),
+              };
+          if (taskList !== undefined) {
+            const validation = validateTaskTree(taskList.tasks, this.taskValidationOptions());
+            if (validation.ok === false) return validation.message;
           }
-          const goal = createGoal({
-            objective: args.objective,
+          const draft = createGoalDraft({
             sessionID: context.sessionID,
-            autoContinue: true,
+            topic: args.objective,
+            objective: args.objective,
             successCriteria: args.successCriteria,
             constraints: args.constraints,
             verificationContract: args.verificationContract,
+            taskList,
+            budgetOverrides: this.goalBudgetOverrides(undefined),
+            autoContinue: args.autoContinue ?? true,
+            status: "proposed",
           });
-          const saved = this.persistGoal(goal, context.sessionID, "goal_created_by_tool");
-          this.queueContinuation(context.sessionID, "tool");
-          return `Goal confirmed and started.\n\n${summarizeGoal(saved)}`;
+          this.persistDraft(draft, context.sessionID, "goal_draft_proposed");
+          return formatGoalDraftConfirmation(draft);
         },
       }),
       propose_goal_tweak: tool({
@@ -607,14 +831,17 @@ export class GoalRuntime {
         description: "Attach or replace a structured task list for the focused goal. Tasks are progress trackers and can block completion.",
         args: TaskListArgs,
         execute: async (args, context) => {
+          this.refreshStore();
           const parsed = taskListInputSchema.safeParse(args);
-          if (!parsed.success) return "Task list rejected: invalid task shape.";
-          const validation = validateTaskIds(parsed.data.tasks);
-          if (!validation.ok) return validation.message;
+          if (parsed.success === false) return "Task list rejected: invalid task shape.";
+          const normalizedTasks = normalizeToolTaskList(parsed.data.tasks);
+          if (normalizedTasks.ok === false) return normalizedTasks.message;
+          const validation = validateTaskTree(normalizedTasks.value, this.taskValidationOptions());
+          if (validation.ok === false) return validation.message;
           const goal = focusedGoal(this.store, context.sessionID);
           if (goal === undefined) return this.noGoalText();
           const taskList: GoalTaskList = {
-            tasks: parsed.data.tasks,
+            tasks: normalizedTasks.value,
             blockCompletion: parsed.data.blockCompletion ?? true,
             proposedAt: nowIso(),
           };
@@ -647,27 +874,58 @@ export class GoalRuntime {
         description: "Read the exact auditor prompt that will be used for the focused goal. This does not complete the goal.",
         args: CompletionClaimArgs,
         execute: async (args, context) => {
-          const goalContext = this.focusedGoalContext(context.sessionID);
-          if (!goalContext.ok) return goalContext.message;
-          return auditPrompt(goalContext.value, args.completionSummary, args.verificationSummary);
+          const goal = this.focusedGoalOrMessage(context.sessionID);
+          if (typeof goal === "string") return goal;
+          return auditPrompt(goal, args.completionSummary, args.verificationSummary);
+        },
+      }),
+      report_auditor_progress: tool({
+        description: "Auditor-only progress reporting tool for visible Goal X audit status. It records progress and never completes a goal.",
+        args: {
+          goalId: tool.schema.string().min(1).optional(),
+          message: tool.schema.string().min(1),
+        },
+        execute: async (args, context) => {
+          this.refreshStore();
+          const goalID = args.goalId ?? this.auditorSessionGoals.get(context.sessionID);
+          if (goalID === undefined) return "No audited goal is associated with this auditor session.";
+          const goal = this.store.goals.find((candidate) => candidate.id === goalID);
+          if (goal === undefined) return `No goal found for auditor progress: ${goalID}`;
+          this.recordAuditProgress(goal, "running", args.message, context.sessionID);
+          appendLedger(this.paths, { type: "goal_audit_progress_reported", goalId: goal.id, auditorSessionID: context.sessionID, message: args.message });
+          return "Audit progress recorded.";
         },
       }),
     };
   }
 
   private completeTask(sessionID: string, taskID: string, verificationSummary: string): string {
-    const taskContext = this.focusedTaskContext(sessionID, taskID);
-    if (!taskContext.ok) return taskContext.message;
-    if (hasOpenSubtasks(taskContext.value.task)) return `Task ${taskID} has pending subtasks. Complete or skip subtasks before completing the parent task.`;
-    const next = this.persistTaskUpdate(sessionID, taskID, taskContext.value, "goal_task_completed", completeTaskUpdate(verificationSummary));
+    const taskContext = this.focusedTaskOrMessage(sessionID, taskID);
+    if (typeof taskContext === "string") return taskContext;
+    if (taskContext.task.status === "complete") return `Task ${taskID} is already complete.\n\n${summarizeGoal(taskContext.goal)}`;
+    if (taskContext.task.status === "skipped") return `Task ${taskID} is skipped; revise or unskip the task before completing it.`;
+    if (hasPendingSubtasks(taskContext.task)) return `Task ${taskID} has pending subtasks. Complete or skip subtasks before completing the parent task.`;
+    if (this.options.strictTaskContracts && taskContext.task.verificationContract !== undefined && verificationSummary.trim().length === 0) {
+      return `Task ${taskID} has a verification contract and requires verificationSummary evidence.`;
+    }
+    const next = this.persistTaskUpdate(sessionID, taskID, taskContext, "goal_task_completed", completeTaskUpdate(verificationSummary));
     return `Task marked complete.\n\n${summarizeGoal(next)}`;
   }
 
   private skipTask(sessionID: string, taskID: string, reason: string): string {
-    const taskContext = this.focusedTaskContext(sessionID, taskID);
-    if (!taskContext.ok) return taskContext.message;
-    const next = this.persistTaskUpdate(sessionID, taskID, taskContext.value, "goal_task_skipped", skipTaskUpdate(reason));
+    const taskContext = this.focusedTaskOrMessage(sessionID, taskID);
+    if (typeof taskContext === "string") return taskContext;
+    if (reason.trim().length === 0) return "skip_task rejected: reason is required.";
+    if (taskContext.task.status === "skipped") return `Task ${taskID} is already skipped.\n\n${summarizeGoal(taskContext.goal)}`;
+    if (taskContext.task.status === "complete") return `Task ${taskID} is already complete and cannot be skipped.`;
+    const next = this.persistTaskUpdate(sessionID, taskID, taskContext, "goal_task_skipped", skipTaskUpdate(reason));
     return `Task skipped.\n\n${summarizeGoal(next)}`;
+  }
+
+  private focusedTaskOrMessage(sessionID: string, taskID: string): FocusedTaskContext | string {
+    const taskContext = this.focusedTaskContext(sessionID, taskID);
+    if (taskContext.ok === false) return taskContext.message;
+    return taskContext.value;
   }
 
   private persistTaskUpdate(
@@ -684,7 +942,7 @@ export class GoalRuntime {
 
   private focusedTaskContext(sessionID: string, taskID: string): OperationResult<FocusedTaskContext> {
     const goalContext = this.focusedGoalContext(sessionID);
-    if (!goalContext.ok) return { ok: false, message: goalContext.message };
+    if (goalContext.ok === false) return { ok: false, message: goalContext.message };
     const goal = goalContext.value;
     const taskList = goal.taskList;
     if (taskList === undefined) return { ok: false, message: "No task list is attached to this goal." };
@@ -694,30 +952,96 @@ export class GoalRuntime {
   }
 
   private focusedGoalContext(sessionID: string): OperationResult<GoalRecord> {
-    const goal = focusedGoal(this.store, sessionID);
+    const goal = this.focusedGoalFromFreshStore(sessionID);
     if (goal === undefined) return { ok: false, message: this.noGoalText() };
     return { ok: true, value: goal };
   }
 
-  private activeFocusedGoal(sessionID: string): GoalRecord | undefined {
-    const goal = focusedGoal(this.store, sessionID);
-    if (goal === undefined) return undefined;
-    if (goal.status !== "active") return undefined;
+  private focusedGoalOrMessage(sessionID: string): GoalRecord | string {
+    const goalContext = this.focusedGoalContext(sessionID);
+    if (goalContext.ok === false) return goalContext.message;
+    return goalContext.value;
+  }
+
+  private activeGoalOrMessage(sessionID: string): GoalRecord | string {
+    return this.goalMatchingOrMessage(sessionID, isActiveGoal, (status) => `Goal is not active. Current status: ${status}`);
+  }
+
+  private openLifecycleGoalOrMessage(sessionID: string, action: string): GoalRecord | string {
+    return this.goalMatchingOrMessage(sessionID, isOpenGoal, (status) => `Cannot ${action} a ${status} goal.`);
+  }
+
+  private goalMatchingOrMessage(
+    sessionID: string,
+    predicate: (goal: GoalRecord) => boolean,
+    failureMessage: (status: GoalRecord["status"]) => string,
+  ): GoalRecord | string {
+    const goal = this.focusedGoalOrMessage(sessionID);
+    if (typeof goal === "string") return goal;
+    if (predicate(goal) === false) return failureMessage(goal.status);
     return goal;
   }
 
-  private autoContinuingGoal(sessionID: string): GoalRecord | undefined {
+  private openFocusedGoal(sessionID: string): MaybeUndefined<GoalRecord> {
+    return this.focusedGoalMatching(sessionID, isOpenGoal);
+  }
+
+  private activeFocusedGoal(sessionID: string): MaybeUndefined<GoalRecord> {
+    return this.focusedGoalMatching(sessionID, isActiveGoal);
+  }
+
+  private focusedGoalMatching(sessionID: string, predicate: (goal: GoalRecord) => boolean): MaybeUndefined<GoalRecord> {
+    const goal = this.focusedGoalFromFreshStore(sessionID);
+    if (goal === undefined) return undefined;
+    if (predicate(goal) === false) return undefined;
+    return goal;
+  }
+
+  private focusedGoalFromFreshStore(sessionID: string): MaybeUndefined<GoalRecord> {
+    this.refreshStore();
+    return focusedGoal(this.store, sessionID);
+  }
+
+  private autoContinuingGoal(sessionID: string): MaybeUndefined<GoalRecord> {
     const goal = this.activeFocusedGoal(sessionID);
     if (goal === undefined) return undefined;
-    if (!goal.autoContinue) return undefined;
+    if (goal.autoContinue === false) return undefined;
     return goal;
+  }
+
+  private taskValidationOptions(): TaskValidationOptions {
+    return {
+      maxTaskCount: this.options.maxTaskCount,
+      maxSubtaskDepth: this.options.maxSubtaskDepth,
+      strictTaskContracts: this.options.strictTaskContracts,
+    };
+  }
+
+  private goalBudgetOverrides(overrides: MaybeUndefined<Partial<GoalBudget>>): Partial<GoalBudget> {
+    const budgetOverrides = overrides ?? {};
+    return {
+      maxTurns: budgetOverrides.maxTurns ?? this.options.maxTurns,
+      maxRuntimeMs: budgetOverrides.maxRuntimeMs ?? this.options.maxRuntimeMs,
+      maxTokens: budgetOverrides.maxTokens ?? this.options.maxTokens,
+      minDelayMs: budgetOverrides.minDelayMs ?? this.options.minDelayMs,
+      noProgressTurnsBeforePause: budgetOverrides.noProgressTurnsBeforePause ?? this.options.noProgressTurnsBeforePause,
+      noToolCallTurnsBeforePause: budgetOverrides.noToolCallTurnsBeforePause ?? this.options.noToolCallTurnsBeforePause,
+      noProgressTokenThreshold: budgetOverrides.noProgressTokenThreshold ?? this.options.noProgressTokenThreshold,
+      maxPromptFailures: budgetOverrides.maxPromptFailures ?? this.options.maxPromptFailures,
+    };
+  }
+
+  private recordAuditProgress(goal: GoalRecord, status: NonNullable<GoalRecord["auditProgress"]>["status"], message: string, auditorSessionID?: string): NonNullable<GoalRecord["auditProgress"]> {
+    if (auditorSessionID !== undefined) this.auditorSessionGoals.set(auditorSessionID, goal.id);
+    const progress = { status, message, auditorSessionID, updatedAt: nowIso() };
+    this.mergeAuditProgress(goal.id, progress);
+    this.persistGoal({ ...goal, auditProgress: progress, updatedAt: nowIso() }, goal.sessionID ?? "audit", "goal_audit_progress");
+    return progress;
   }
 
   private async completeGoal(sessionID: string, directory: string, completionSummary: string, verificationSummary: string): Promise<string> {
-    const goalContext = this.focusedGoalContext(sessionID);
-    if (!goalContext.ok) return goalContext.message;
-    const goal = goalContext.value;
-    if (goal.status !== "active" && goal.status !== "paused") return `Cannot complete a ${goal.status} goal.`;
+    const goal = this.openLifecycleGoalOrMessage(sessionID, "complete");
+    if (typeof goal === "string") return goal;
     if (hasPendingBlockingTasks(goal)) return "complete_goal rejected: pending blocking tasks remain.";
     if (goal.verificationContract !== undefined && verificationSummary.trim().length === 0) {
       return "complete_goal rejected: verificationSummary is required by the goal verification contract.";
@@ -725,6 +1049,7 @@ export class GoalRuntime {
 
     if (this.options.requireAudit) {
       await this.toast("Auditing goal completion...", "info");
+      this.recordAuditProgress(goal, "starting", "Completion audit started.");
       const audit = await runCompletionAudit({
         client: this.input.client,
         directory,
@@ -733,8 +1058,10 @@ export class GoalRuntime {
         completionSummary,
         verificationSummary,
         options: this.options,
+        executionContext: this.executionContextFor(sessionID),
+        onProgress: (message, auditorSessionID) => this.recordAuditProgress(goal, "running", message, auditorSessionID),
       });
-      if (!audit.approved) {
+      if (audit.approved === false) {
         const rejected = updateGoalStatus(goal, "paused", {
           autoContinue: false,
           stopReason: "audit_rejected",
@@ -743,11 +1070,13 @@ export class GoalRuntime {
           verificationSummary,
           audit: auditRecord("rejected", audit.output.length === 0 ? audit.error ?? "Audit rejected." : audit.output, audit),
         });
-        this.persistGoal(rejected, sessionID, "goal_audit_rejected");
+        const auditProgress = this.recordAuditProgress(rejected, "rejected", audit.error ?? "Completion audit rejected the claim.", audit.auditorSessionID);
+        this.persistGoal({ ...rejected, auditProgress }, sessionID, "goal_audit_rejected");
         this.clearContinuation(sessionID);
         return `Goal completion rejected by audit.\n\n${summarizeGoal(rejected)}\n\nAudit output:\n${audit.output || audit.error || "No audit output."}`;
       }
 
+      this.recordAuditProgress(goal, "approved", "Completion audit approved the goal.", audit.auditorSessionID);
       const complete = completeGoalRecord(goal, completionSummary, verificationSummary, auditRecord("approved", audit.output, audit));
       const saved = this.persistAndUnfocus(sessionID, complete, "goal_completed");
       await this.toast("Goal complete.", "success");
@@ -767,12 +1096,13 @@ export class GoalRuntime {
     return saved;
   }
 
-  private sessionPromptInput(sessionID: string, text: string): SessionTextPromptInput {
-    return {
-      path: { id: sessionID },
-      query: { directory: this.input.directory },
-      body: { parts: [{ type: "text", text }] },
-    };
+  private sessionPromptInput(sessionID: string, text: string): VariantAwareTextPromptInput {
+    return buildVariantAwareTextPrompt({
+      sessionID,
+      directory: this.input.directory,
+      text,
+      executionContext: this.executionContextFor(sessionID),
+    });
   }
 
   private async toast(message: string, variant: "info" | "success" | "warning" | "error"): Promise<void> {
@@ -783,7 +1113,15 @@ export class GoalRuntime {
     }
   }
 
-  private async log(level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>): Promise<void> {
+  private runBackgroundTask(task: Promise<void>, failureMessage: string, extra?: UnknownRecord): void {
+    task.catch((error: unknown) => {
+      this.log("warn", failureMessage, { ...extra, error: errorMessage(error) }).catch((logError: unknown) => {
+        console.warn(`[opencode-goal-x] background task log failed: ${errorMessage(logError)}`);
+      });
+    });
+  }
+
+  private async log(level: "debug" | "info" | "warn" | "error", message: string, extra?: UnknownRecord): Promise<void> {
     try {
       await this.input.client.app.log({ body: { service: PLUGIN_NAME, level, message, extra } });
     } catch (error) {
@@ -795,6 +1133,16 @@ export class GoalRuntime {
 
 function handled(text: string, shouldAutoContinue: boolean): CommandExecutionResult {
   return { text, shouldAutoContinue };
+}
+
+function isActiveGoal(goal: GoalRecord): boolean {
+  return goal.status === "active";
+}
+
+function findOpenGoalBySelector(goals: GoalRecord[], selector: string): MaybeUndefined<GoalRecord> {
+  const maybeIndex = Number.parseInt(selector, 10);
+  if (Number.isInteger(maybeIndex) && String(maybeIndex) === selector) return goals[maybeIndex - 1];
+  return goals.find((goal) => goal.id === selector || goal.id.startsWith(selector));
 }
 
 function resetGoalRunProgress(goal: GoalRecord): GoalRecord["progress"] {
@@ -810,12 +1158,13 @@ function resetGoalRunProgress(goal: GoalRecord): GoalRecord["progress"] {
   };
 }
 
-function auditRecord(decision: "approved" | "rejected", summary: string, audit: { auditorSessionID?: string; model?: string }): NonNullable<GoalRecord["audit"]> {
+function auditRecord(decision: "approved" | "rejected", summary: string, audit: AuditRecordInput): NonNullable<GoalRecord["audit"]> {
   return {
     decision,
     summary,
     auditorSessionID: audit.auditorSessionID,
     model: audit.model,
+    variant: audit.variant,
     createdAt: nowIso(),
   };
 }
@@ -853,8 +1202,10 @@ function taskStatusUpdate(updates: Partial<GoalTask>): (task: GoalTask) => GoalT
 function helpText(commandName: string): string {
   return [
     "opencode-goal-x commands:",
-    `/${commandName} <objective>`,
-    `/${commandName}-set <objective>`,
+    `/${commandName} <topic> (draft; requires /${commandName}-confirm before start)`,
+    `/${commandName}-set <objective> (immediate start)`,
+    `/${commandName}-confirm [draft-id]`,
+    `/${commandName}-reject [draft-id]`,
     `/${commandName}-status`,
     `/${commandName}-list`,
     `/${commandName}-focus <number-or-id>`,
@@ -865,35 +1216,6 @@ function helpText(commandName: string): string {
     `/${commandName}-clear`,
     "Flags for start: --max-turns, --max-minutes, --budget, --success, --constraints, --contract.",
   ].join("\n");
-}
-
-function validateTaskIds(tasks: GoalTask[]): OperationResult<void> {
-  const seen = new Set<string>();
-  for (const task of tasks) {
-    const duplicate = collectTaskIds(task, seen);
-    if (duplicate !== undefined) return { ok: false, message: `Task list rejected: duplicate task id ${duplicate}.` };
-  }
-  return { ok: true, value: undefined };
-}
-
-function collectTaskIds(task: GoalTask, seen: Set<string>): string | undefined {
-  if (seen.has(task.id)) return task.id;
-  seen.add(task.id);
-  if (task.subtasks === undefined) return undefined;
-  for (const subtask of task.subtasks) {
-    const duplicate = collectTaskIds(subtask, seen);
-    if (duplicate !== undefined) return duplicate;
-  }
-  return undefined;
-}
-
-function hasOpenSubtasks(task: GoalTask): boolean {
-  if (task.subtasks === undefined) return false;
-  for (const subtask of task.subtasks) {
-    if (subtask.status === "pending") return true;
-    if (hasOpenSubtasks(subtask)) return true;
-  }
-  return false;
 }
 
 export function createGoalRuntime(input: PluginInput, rawOptions: unknown = DEFAULT_OPTIONS): GoalRuntime {

@@ -1,4 +1,4 @@
-import type { GoalBudget, ParsedGoalCommand, OperationResult } from "./types";
+import type { GoalBudget, MaybeUndefined, ParsedGoalCommand, OperationResult } from "./types";
 
 const STATUS_WORDS = new Set(["status", "show"]);
 const LIST_WORDS = new Set(["list", "ls"]);
@@ -10,9 +10,21 @@ const FOCUS_WORDS = new Set(["focus", "switch"]);
 const TWEAK_WORDS = new Set(["tweak", "edit", "revise"]);
 const HELP_WORDS = new Set(["help", "?"]);
 
+interface FlagValueRead {
+  flag: string;
+  value: string;
+  nextIndex: number;
+}
+
+interface NumericParseOptions {
+  integer: boolean;
+  allowZero: boolean;
+  description: string;
+}
+
 export function parseGoalCommand(commandName: string, defaultCommandName: string, rawArguments: string): OperationResult<ParsedGoalCommand> {
   const tokensResult = splitCommandLine(rawArguments);
-  if (!tokensResult.ok) return tokensResult;
+  if (tokensResult.ok === false) return tokensResult;
   const tokens = tokensResult.value;
 
   if (commandName === `${defaultCommandName}-status`) return okCommand("status");
@@ -23,6 +35,8 @@ export function parseGoalCommand(commandName: string, defaultCommandName: string
   if (commandName === `${defaultCommandName}-abort`) return okCommand("abort", { reason: rawArguments });
   if (commandName === `${defaultCommandName}-focus`) return okCommand("focus", { goalId: rawArguments.trim() });
   if (commandName === `${defaultCommandName}-tweak`) return okCommand("tweak", { objective: rawArguments.trim() });
+  if (commandName === `${defaultCommandName}-confirm`) return okCommand("confirm", { goalId: rawArguments.trim() });
+  if (commandName === `${defaultCommandName}-reject`) return okCommand("reject", { goalId: rawArguments.trim() });
   if (commandName === `${defaultCommandName}-set`) return parseStart(tokens);
 
   if (tokens.length === 0) return okCommand("status");
@@ -39,34 +53,46 @@ export function parseGoalCommand(commandName: string, defaultCommandName: string
   if (ABORT_WORDS.has(lowerFirst)) return okCommand("abort", { reason: rest });
   if (FOCUS_WORDS.has(lowerFirst)) return okCommand("focus", { goalId: rest.trim() });
   if (TWEAK_WORDS.has(lowerFirst)) return okCommand("tweak", { objective: rest.trim() });
+  if (lowerFirst === "confirm") return okCommand("confirm", { goalId: rest.trim() });
+  if (lowerFirst === "reject" || lowerFirst === "discard-draft") return okCommand("reject", { goalId: rest.trim() });
   if (HELP_WORDS.has(lowerFirst)) return okCommand("help");
 
-  return parseStart(tokens);
+  return parseDraft(tokens);
+}
+
+function parseDraft(tokens: string[]): OperationResult<ParsedGoalCommand> {
+  const parsed = parseGoalDefinition(tokens, "draft");
+  if (parsed.ok === false) return parsed;
+  return parsed;
 }
 
 function parseStart(tokens: string[]): OperationResult<ParsedGoalCommand> {
+  return parseGoalDefinition(tokens, "start");
+}
+
+function parseGoalDefinition(tokens: string[], action: "draft" | "start"): OperationResult<ParsedGoalCommand> {
   const objectiveParts: string[] = [];
   const budgetOverrides: Partial<GoalBudget> = {};
-  let successCriteria: string | undefined;
-  let constraints: string | undefined;
-  let verificationContract: string | undefined;
+  let successCriteria: MaybeUndefined<string>;
+  let constraints: MaybeUndefined<string>;
+  let verificationContract: MaybeUndefined<string>;
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (token === undefined) continue;
-    if (!token.startsWith("--")) {
+    if (token.startsWith("--") === false) {
       objectiveParts.push(token);
       continue;
     }
 
     const flagResult = readFlagValue(tokens, index);
-    if (!flagResult.ok) return flagResult;
+    if (flagResult.ok === false) return flagResult;
     index = flagResult.value.nextIndex;
     const flag = flagResult.value.flag;
     const value = flagResult.value.value;
 
     const budgetFlag = applyKnownBudgetFlag(flag, value, budgetOverrides);
-    if (!budgetFlag.ok) return budgetFlag;
+    if (budgetFlag.ok === false) return budgetFlag;
     if (budgetFlag.value) continue;
     if (flag === "success" || flag === "success-criteria") {
       successCriteria = value;
@@ -89,7 +115,7 @@ function parseStart(tokens: string[]): OperationResult<ParsedGoalCommand> {
   return {
     ok: true,
     value: {
-      action: "start",
+      action,
       objective,
       successCriteria,
       constraints,
@@ -103,7 +129,7 @@ function okCommand(action: ParsedGoalCommand["action"], partial?: Partial<Parsed
   return { ok: true, value: { action, budgetOverrides: {}, ...partial } };
 }
 
-function readFlagValue(tokens: string[], index: number): OperationResult<{ flag: string; value: string; nextIndex: number }> {
+function readFlagValue(tokens: string[], index: number): OperationResult<FlagValueRead> {
   const token = tokens[index];
   if (token === undefined) return { ok: false, message: "Missing flag." };
   const rawFlag = token.slice(2);
@@ -129,7 +155,7 @@ function applyBudgetFlag(
   assign: (numberValue: number) => void,
 ): OperationResult<boolean> {
   const numberResult = parse(value, flag);
-  if (!numberResult.ok) return numberResult;
+  if (numberResult.ok === false) return numberResult;
   assign(numberResult.value);
   return { ok: true, value: true };
 }
@@ -193,12 +219,12 @@ function parsePositiveNumber(value: string, flag: string): OperationResult<numbe
 function parseNumericValue(
   value: string,
   flag: string,
-  options: { integer: boolean; allowZero: boolean; description: string },
+  options: NumericParseOptions,
 ): OperationResult<number> {
   const numericPattern = options.integer ? /^\d+$/ : /^\d+(?:\.\d+)?$/;
-  if (!numericPattern.test(value)) return { ok: false, message: `--${flag} must be ${options.description}.` };
+  if (numericPattern.test(value) === false) return { ok: false, message: `--${flag} must be ${options.description}.` };
   const parsed = options.integer ? Number.parseInt(value, 10) : Number.parseFloat(value);
-  if (!options.allowZero && parsed <= 0) return { ok: false, message: `--${flag} must be greater than zero.` };
+  if (options.allowZero === false && parsed <= 0) return { ok: false, message: `--${flag} must be greater than zero.` };
   return { ok: true, value: parsed };
 }
 
@@ -210,14 +236,19 @@ function parseTokenBudget(value: string, flag: string): OperationResult<number> 
   const suffix = match[2];
   const amount = Number.parseFloat(amountText);
   if (amount <= 0) return { ok: false, message: `--${flag} must be greater than zero.` };
-  const multiplier = suffix === undefined ? 1 : suffix.toLowerCase() === "k" ? 1_000 : 1_000_000;
-  return { ok: true, value: Math.round(amount * multiplier) };
+  return { ok: true, value: Math.round(amount * tokenBudgetMultiplier(suffix)) };
+}
+
+function tokenBudgetMultiplier(suffix: MaybeUndefined<string>): number {
+  if (suffix === undefined) return 1;
+  if (suffix.toLowerCase() === "k") return 1_000;
+  return 1_000_000;
 }
 
 export function splitCommandLine(input: string): OperationResult<string[]> {
   const tokens: string[] = [];
   let current = "";
-  let quote: string | undefined;
+  let quote: MaybeUndefined<string>;
   let escaped = false;
 
   for (const char of input) {

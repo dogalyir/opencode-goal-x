@@ -1,7 +1,13 @@
 import { countTasks, summarizeGoal } from "./goal";
 import { appendGoalContractLines } from "./goal-details";
 import { renderTaskTree } from "./task-render";
-import type { GoalRecord } from "./types";
+import type { GoalRecord, UnknownRecord } from "./types";
+
+export interface CompactionContextInput {
+  focusedGoal: GoalRecord;
+  openGoals: GoalRecord[];
+  recentLedgerEvents?: UnknownRecord[];
+}
 
 export function goalSystemPrompt(goal: GoalRecord): string {
   return [
@@ -40,14 +46,23 @@ export function continuationPrompt(goal: GoalRecord): string {
   ].filter(isNonEmptyLine).join("\n");
 }
 
-export function compactionContext(goal: GoalRecord): string {
+export function compactionContext(input: CompactionContextInput): string {
+  const otherGoals = input.openGoals.filter((goal) => goal.id !== input.focusedGoal.id);
   return [
     "## opencode-goal-x Continuity",
     "A durable goal is active and must survive compaction.",
-    summarizeGoal(goal),
     "",
-    "Continuation rule: after compaction, continue this exact objective unless it is paused, complete, aborted, or superseded by an explicit user tweak.",
-  ].join("\n");
+    "### Focused goal",
+    summarizeGoal(input.focusedGoal),
+    "",
+    taskBlock(input.focusedGoal),
+    latestAuditBlock(input.focusedGoal),
+    pauseBlock(input.focusedGoal),
+    otherGoalsBlock(otherGoals),
+    recentLedgerBlock(input.recentLedgerEvents ?? []),
+    "Continuation rule: after compaction, continue this exact objective unless it is paused, complete, aborted, deleted, externally archived, or superseded by an explicit user tweak.",
+    "Next action rule: inspect the latest real workspace state before continuing; do not rely solely on this summary.",
+  ].filter(isNonEmptyLine).join("\n");
 }
 
 export function limitWrapUpPrompt(goal: GoalRecord, reason: string): string {
@@ -65,7 +80,7 @@ export function auditPrompt(goal: GoalRecord, completionSummary: string, verific
     "You are the independent completion auditor for opencode-goal-x.",
     "The executor claims the user's durable goal is complete. Decide whether the actual requested outcome is satisfied.",
     "Be skeptical and semantic. Do not approve based on effort, intent, file count, green tests, or plausible summaries alone.",
-    "Inspect the repository with read-only intent. You may use normal OpenCode tools, but do not modify files.",
+    "Inspect the repository with read-only intent. Do not edit, write, patch, apply changes, or run risky shell commands.",
     "Reject scaffold-only, alpha, shallow, proxy-metric, or weakly verified completion claims.",
     "Your final line must be exactly one of:",
     "<approved/>",
@@ -90,11 +105,12 @@ export function auditPrompt(goal: GoalRecord, completionSummary: string, verific
     "</verification_summary>",
     "",
     "Audit checklist:",
-    "1. Extract every explicit success criterion, constraint, required artifact, command, and user-facing outcome.",
-    "2. Inspect the actual workspace or command output needed to prove those criteria.",
+    "1. Extract every explicit success criterion, constraint, required artifact, command, task contract, verification contract, and user-facing outcome.",
+    "2. Inspect the actual workspace or command output needed to prove those criteria with read-only methods.",
     "3. Cross-check executor claims against real evidence; claims are not proof.",
-    "4. If any criterion is missing, ambiguous, stale, weakly verified, or not inspectable, reject.",
-    "5. End with <approved/> only when the objective is truly satisfied. Otherwise end with <rejected/>.",
+    "4. Treat pending blocking tasks, missing verificationSummary coverage, stale disk state, or uninspected required artifacts as rejection reasons.",
+    "5. If any criterion is missing, ambiguous, stale, weakly verified, or not inspectable, reject.",
+    "6. End with <approved/> only when the objective is truly satisfied. Otherwise end with <rejected/>.",
   ].filter(isNonEmptyLine).join("\n");
 }
 
@@ -125,6 +141,35 @@ function taskBlock(goal: GoalRecord): string {
     lines.push("Task gate: do not call complete_goal while pending tasks remain unless the task list is explicitly revised or tasks are skipped for a user-approved reason.");
   }
   lines.push(...renderTaskTree(goal.taskList.tasks, { mode: "prompt", includeEvidenceLines: true }));
+  return lines.join("\n");
+}
+
+function latestAuditBlock(goal: GoalRecord): string {
+  if (goal.audit === undefined) return "";
+  const lines = ["### Latest audit", `${goal.audit.decision} at ${goal.audit.createdAt}`];
+  if (goal.audit.auditorSessionID !== undefined) lines.push(`Auditor session: ${goal.audit.auditorSessionID}`);
+  if (goal.audit.model !== undefined) lines.push(`Auditor model: ${goal.audit.model}`);
+  if (goal.audit.variant !== undefined) lines.push(`Auditor variant: ${goal.audit.variant}`);
+  if (goal.audit.summary.length > 0) lines.push(goal.audit.summary);
+  return lines.join("\n");
+}
+
+function pauseBlock(goal: GoalRecord): string {
+  if (goal.pauseReason === undefined) return "";
+  return ["### Pause reason", goal.pauseReason].join("\n");
+}
+
+function otherGoalsBlock(goals: GoalRecord[]): string {
+  if (goals.length === 0) return "";
+  const lines = ["### Other open goals"];
+  for (const goal of goals) lines.push(`- ${goal.id} [${goal.status}] ${goal.objective}`);
+  return lines.join("\n");
+}
+
+function recentLedgerBlock(events: UnknownRecord[]): string {
+  if (events.length === 0) return "";
+  const lines = ["### Recent goal ledger events"];
+  for (const event of events) lines.push(`- ${JSON.stringify(event)}`);
   return lines.join("\n");
 }
 
