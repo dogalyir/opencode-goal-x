@@ -1,0 +1,46 @@
+{
+  "name": "opencode-goal-x",
+  "version": "0.1.0",
+  "description": "Durable goal mode for opencode with auto-continue, compaction continuity, schema-gated lifecycle tools, and fail-closed completion audits.",
+  "module": "src/index.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "bun test",
+    "check:all": "bun run check && bun test",
+    "smoke": "bun run check"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "goal",
+    "auto-continue",
+    "agent-loop",
+    "audit"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^26.0.1"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.17.11",
+    "@opencode-ai/sdk": "^1.17.11",
+    "zod": "^4.4.3"
+  },
+  "private": true
+}
