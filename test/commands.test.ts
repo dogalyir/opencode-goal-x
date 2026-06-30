@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { parseGoalCommand, splitCommandLine } from "../src/commands";
 
 describe("goal command parser", () => {
-  test("parses start command with budget and contract flags", () => {
+  test("parses /goal as a draft command with budget and contract flags", () => {
     const parsed = parseGoalCommand(
       "goal",
       "goal",
@@ -10,13 +10,30 @@ describe("goal command parser", () => {
     );
 
     const command = requireParseSuccess(parsed);
-    expect(command.action).toBe("start");
+    expect(command.action).toBe("draft");
     expect(command.objective).toBe("fix tests");
     expect(command.budgetOverrides.maxTurns).toBe(20);
     expect(command.budgetOverrides.maxTokens).toBe(1_500_000);
     expect(command.successCriteria).toBe("suite passes");
     expect(command.constraints).toBe("do not change public API");
     expect(command.verificationContract).toBe("run bun test");
+  });
+
+  test("parses /goal-set as immediate start", () => {
+    const parsed = parseGoalCommand("goal-set", "goal", "ship it --max-turns 2");
+
+    const command = requireParseSuccess(parsed);
+    expect(command.action).toBe("start");
+    expect(command.objective).toBe("ship it");
+    expect(command.budgetOverrides.maxTurns).toBe(2);
+  });
+
+  test("maps draft confirmation commands", () => {
+    const parsed = parseGoalCommand("goal-confirm", "goal", "draft-1");
+
+    const command = requireParseSuccess(parsed);
+    expect(command.action).toBe("confirm");
+    expect(command.goalId).toBe("draft-1");
   });
 
   test("maps command aliases to lifecycle actions", () => {
@@ -36,14 +53,14 @@ describe("goal command parser", () => {
     const split = splitCommandLine("one \"two words\" 'three words'");
 
     expect(split.ok).toBe(true);
-    if (!split.ok) throw new Error(split.message);
+    if (split.ok === false) throw new Error(split.message);
     expect(split.value).toEqual(["one", "two words", "three words"]);
   });
 });
 
 function requireParseSuccess(parsed: ReturnType<typeof parseGoalCommand>) {
   expect(parsed.ok).toBe(true);
-  if (!parsed.ok) throw new Error(parsed.message);
+  if (parsed.ok === false) throw new Error(parsed.message);
   return parsed.value;
 }
 
