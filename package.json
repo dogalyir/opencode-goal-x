@@ -1,13 +1,21 @@
 {
   "name": "opencode-goal-x",
   "version": "0.1.0",
-  "description": "Durable goal mode for opencode with auto-continue, compaction continuity, schema-gated lifecycle tools, and fail-closed completion audits.",
+  "description": "OpenCode-native durable goal system with draft confirmation, autoContinue, TUI status, todo awareness, context preservation, and fail-closed audits.",
   "module": "src/index.ts",
   "type": "module",
   "exports": {
     ".": {
       "import": "./src/index.ts",
       "types": "./src/index.ts"
+    },
+    "./server": {
+      "import": "./src/server.ts",
+      "types": "./src/server.ts"
+    },
+    "./tui": {
+      "import": "./src/tui.ts",
+      "types": "./src/tui.ts"
     }
   },
   "files": [
@@ -21,13 +29,18 @@
     "check:all": "bun run check && bun test",
     "smoke": "bun run check"
   },
+  "engines": {
+    "opencode": ">=1.17.11"
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",
     "goal",
     "auto-continue",
     "agent-loop",
-    "audit"
+    "audit",
+    "tui-plugin",
+    "todo"
   ],
   "license": "MIT",
   "devDependencies": {
@@ -41,6 +54,9 @@
     "@opencode-ai/plugin": "^1.17.11",
     "@opencode-ai/sdk": "^1.17.11",
     "zod": "^4.4.3"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "private": true
 }
