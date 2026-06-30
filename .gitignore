@@ -27,8 +27,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .cache
 *.tsbuildinfo
 
-# opencode-goal-x local runtime state
+# local agent/runtime state
 .opencode/goals/
+.pi/
 
 # IntelliJ based IDEs
 .idea
