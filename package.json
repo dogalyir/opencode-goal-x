@@ -1,7 +1,7 @@
 {
   "name": "opencode-goal-x",
-  "version": "0.1.0",
-  "description": "OpenCode-native durable goal system with draft confirmation, autoContinue, TUI status, todo awareness, context preservation, and fail-closed audits.",
+  "version": "0.1.1",
+  "description": "OpenCode plugin for persistent AI goals with draft confirmation, automatic continuations, todo sync, TUI status, and fail-closed audits.",
   "module": "src/index.ts",
   "type": "module",
   "exports": {
@@ -35,13 +35,22 @@
   "keywords": [
     "opencode",
     "opencode-plugin",
-    "goal",
+    "goal-management",
     "auto-continue",
-    "agent-loop",
+    "ai-agents",
+    "workflow-automation",
     "audit",
     "tui-plugin",
-    "todo"
+    "todo-sync"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dogalyir/opencode-goal-x.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dogalyir/opencode-goal-x/issues"
+  },
+  "homepage": "https://github.com/dogalyir/opencode-goal-x#readme",
   "license": "MIT",
   "devDependencies": {
     "@types/bun": "latest",
@@ -57,6 +66,5 @@
   },
   "publishConfig": {
     "access": "public"
-  },
-  "private": true
+  }
 }
