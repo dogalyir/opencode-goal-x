@@ -1,6 +1,6 @@
 {
   "name": "opencode-goal-x",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "OpenCode plugin for persistent AI goals with draft confirmation, automatic continuations, todo sync, TUI status, and fail-closed audits.",
   "module": "src/index.ts",
   "type": "module",
