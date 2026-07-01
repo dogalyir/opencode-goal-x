@@ -31,6 +31,8 @@ Goal X asks the assistant to refine that topic into a proposed goal. No durable 
 /goal-confirm
 ```
 
+By default, the `/goal` draft command runs through OpenCode's `plan` agent and `/goal-confirm` switches execution to `build`.
+
 If you already know the exact objective and want to start immediately, use `/goal-set` instead:
 
 ```text
@@ -49,6 +51,7 @@ The TUI plugin target, `opencode-goal-x/tui`, is optional. Load it through OpenC
 
 - Keeps a persistent goal pool in `.opencode/goals/` with active markdown mirrors, archived markdown files, strict `state.json`, pending drafts, captured execution context, audit progress, and append-only `ledger.jsonl`.
 - Makes `/goal <topic>` safe by default: it starts a draft/planning flow and never creates or executes a goal until explicit `/goal-confirm`.
+- Registers draft commands with the `plan` agent and start/resume commands with the `build` agent by default, with plugin options for custom agent names.
 - Provides `/goal-set <objective>` as the explicit immediate-start shortcut.
 - Captures active agent/model/provider/variant context and reuses it for plugin-driven continuations, compaction followups, and audits unless explicit auditor config overrides it. Non-default variants such as `xhigh` are preserved by default.
 - Runs guarded auto-continuation from `session.idle`, with budget limits for turns, runtime, tracked tokens, prompt failures, no-tool loops, low-progress loops, and stale focus.
@@ -181,6 +184,8 @@ Configure through OpenCode's plugin tuple form:
         "maxRuntimeMs": 28800000,
         "maxTokens": 2000000,
         "minDelayMs": 1000,
+        "planningAgent": "plan",
+        "executionAgent": "build",
         "noProgressTurnsBeforePause": 4,
         "noToolCallTurnsBeforePause": 3,
         "noProgressTokenThreshold": 40,
@@ -205,6 +210,8 @@ Useful options:
 
 - `commandName`: command prefix, default `goal`.
 - `stateDir`: project-relative state directory, default `.opencode/goals`; absolute paths, traversal, and NUL bytes are rejected.
+- `planningAgent`: agent assigned to `/goal`, default `plan`.
+- `executionAgent`: agent assigned to `/goal-set`, `/goal-confirm`, and `/goal-resume`, default `build`.
 - `maxTurns`, `maxRuntimeMs`, `maxTokens`, `minDelayMs`: autoContinue budgets.
 - `noProgressTurnsBeforePause`, `noToolCallTurnsBeforePause`, `noProgressTokenThreshold`, `maxPromptFailures`: conservative loop guards.
 - `requireAudit` / `completionAudit`: fail-closed audit gate, default `true`.
@@ -282,7 +289,7 @@ Manual OpenCode smoke tests before release:
 1. Start OpenCode with this plugin loaded locally and restart after config changes.
 2. Select a non-default model variant such as `xhigh`.
 3. Run `/goal draft a small verified change`; verify no active goal appears before confirmation.
-4. Confirm the draft with `/goal-confirm`; verify the same agent/model/variant remains selected.
+4. Confirm the draft with `/goal-confirm`; verify execution switches to the configured execution agent while preserving model/variant context.
 5. Run `/goal-set make a trivial documented test fixture --max-turns 2`; verify immediate persistence and autoContinue.
 6. Force/simulate compaction; verify Goal X context survives and generic compaction auto-continue does not race the goal loop.
 7. Trigger `complete_goal` with weak evidence; verify the audit rejects and pauses.
