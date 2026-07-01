@@ -53,7 +53,11 @@ describe("GoalRuntime integration-style behavior", () => {
 
     await configHook(config);
     expect(config.command?.goal).toBeDefined();
+    expect(config.command?.goal?.agent).toBe("plan");
+    expect(config.command?.["goal-set"]?.agent).toBe("build");
     expect(config.command?.["goal-confirm"]).toBeDefined();
+    expect(config.command?.["goal-confirm"]?.agent).toBe("build");
+    expect(config.command?.["goal-resume"]?.agent).toBe("build");
     expect(config.command?.goals).toBeUndefined();
     expect(config.command?.["goals-confirm"]).toBeUndefined();
 
@@ -77,6 +81,20 @@ describe("GoalRuntime integration-style behavior", () => {
     const store = loadStore(setup.paths);
     expect(firstText(singularConfirmParts)).toContain("Goal draft confirmed");
     expect(store.goals).toHaveLength(1);
+    await setup.runtime.disposeForTest();
+  });
+
+  test("custom planning and execution agents are registered on goal commands", async () => {
+    const setup = createRuntimeSetup({ requireAudit: false, planningAgent: "goal-planner", executionAgent: "goal-builder" });
+    const configHook = requireConfigHook(setup.hooks);
+    const config: Config = {};
+
+    await configHook(config);
+
+    expect(config.command?.goal?.agent).toBe("goal-planner");
+    expect(config.command?.["goal-set"]?.agent).toBe("goal-builder");
+    expect(config.command?.["goal-confirm"]?.agent).toBe("goal-builder");
+    expect(config.command?.["goal-resume"]?.agent).toBe("goal-builder");
     await setup.runtime.disposeForTest();
   });
 
