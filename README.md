@@ -6,14 +6,16 @@ Use it when you want OpenCode to keep pursuing a concrete outcome without losing
 
 ## Quick Start
 
-Add the server plugin target to your `opencode.json`:
+Add the server plugin package to your `opencode.json`:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-goal-x/server"]
+  "plugin": ["opencode-goal-x"]
 }
 ```
+
+Use the package name in OpenCode config. `opencode-goal-x/server` is an exported module subpath, but OpenCode's npm plugin installer expects the installable package name.
 
 Restart OpenCode. Plugins are loaded at startup, so running sessions will not see new plugin config until you quit and reopen OpenCode.
 
@@ -39,7 +41,7 @@ By default, state is stored in `.opencode/goals/` inside the current project. Us
 
 ## Optional TUI Target
 
-The server plugin target, `opencode-goal-x/server`, owns commands, tools, lifecycle state, auto-continuation, todo sync, and audits. Load this target first for Goal X to work.
+The server plugin package, `opencode-goal-x`, owns commands, tools, lifecycle state, auto-continuation, todo sync, and audits. Load this package for Goal X to work.
 
 The TUI plugin target, `opencode-goal-x/tui`, is optional. Load it through OpenCode's TUI plugin mechanism when you want dashboard/status UI for the same `.opencode/goals/` files. It is target-exclusive and does not replace the server plugin.
 
@@ -58,10 +60,10 @@ The TUI plugin target, `opencode-goal-x/tui`, is optional. Load it through OpenC
 
 ## Package Targets
 
-This package keeps the default export compatible with existing server-plugin loading and also exposes explicit OpenCode targets:
+This package keeps the default export as the supported npm server-plugin entrypoint and also exposes explicit module subpaths:
 
-- `opencode-goal-x` / `.`: server plugin compatibility export.
-- `opencode-goal-x/server`: explicit server plugin target.
+- `opencode-goal-x` / `.`: supported server plugin config target.
+- `opencode-goal-x/server`: server plugin module subpath for direct import/module loaders; do not use this as the npm plugin install string in `opencode.json`.
 - `opencode-goal-x/tui`: TUI plugin target.
 
 Goal X is built directly on OpenCode server-plugin hooks, native sessions, command hooks, compaction hooks, custom tools, state files, and a target-exclusive TUI plugin module.
@@ -74,12 +76,12 @@ For the first npm publish, publish once manually, then configure npm Trusted Pub
 
 ## Troubleshooting
 
-**Plugin not loading?** Check that `opencode.json` uses the server target in the `plugin` array, then fully quit and restart OpenCode. Config and plugin packages are loaded at startup, not hot-reloaded.
+**Plugin not loading?** Check that `opencode.json` uses the package name in the `plugin` array, then fully quit and restart OpenCode. Config and plugin packages are loaded at startup, not hot-reloaded.
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-goal-x/server"]
+  "plugin": ["opencode-goal-x"]
 }
 ```
 
@@ -173,7 +175,7 @@ Configure through OpenCode's plugin tuple form:
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     [
-      "opencode-goal-x/server",
+      "opencode-goal-x",
       {
         "maxTurns": 80,
         "maxRuntimeMs": 28800000,
@@ -289,7 +291,7 @@ Manual OpenCode smoke tests before release:
 
 ## Known OpenCode API Limitations
 
-- TUI plugins are a separate target; load `./server` and `./tui` through their respective OpenCode plugin mechanisms.
+- TUI plugins are a separate target; load the server plugin as `opencode-goal-x` in `opencode.json` and load `./tui` through the TUI plugin mechanism.
 - No Browser UI plugin target is implemented because no analogous public BUI plugin API is currently exposed.
 - The server plugin host currently types its client through the legacy SDK path, while current OpenCode SDK v2 types include `SessionPromptData.body.variant`; Goal X builds variant-aware prompt bodies against the current v2 type and passes the same compatible payload through the server client.
 - Strong read-only auditor isolation may still require an OpenCode agent/permission configuration outside this plugin; Goal X sends read-only-oriented tool policy and prompt constraints by default.
