@@ -218,6 +218,7 @@ function normalizedMaxRuntimeMs(options: ParsedPluginOptions): number {
 }
 
 function normalizeCommandName(commandName: string): string {
-  if (commandName.startsWith("/")) return commandName.slice(1);
-  return commandName;
+  const normalized = commandName.startsWith("/") ? commandName.slice(1).trim() : commandName.trim();
+  if (normalized.length === 0) return DEFAULT_OPTIONS.commandName;
+  return normalized;
 }
