@@ -1,6 +1,6 @@
 import { tool, type Config, type Hooks, type PluginInput } from "@opencode-ai/plugin";
 import { runCompletionAudit } from "./audit";
-import { parseGoalCommand } from "./commands";
+import { goalCommandAliases, parseGoalCommand } from "./commands";
 import { createGoalDraft, findSessionDraft, formatGoalDraftConfirmation, formatGoalDraftHeaderLines, removeDraft, upsertDraft } from "./draft";
 import { DEFAULT_OPTIONS, MEANINGFUL_PROGRESS_TOOLS, PLUGIN_NAME } from "./defaults";
 import { errorMessage } from "./errors";
@@ -80,6 +80,10 @@ const CompletionClaimArgs = {
   verificationSummary: tool.schema.string().min(1),
 };
 
+const COMMAND_DEDUPE_MS = 2_000;
+const COMMAND_INTERRUPTION_IGNORE_MS = 2_000;
+const RECENT_DRAFT_CONFIRM_MS = 10_000;
+
 const TaskIdArg = tool.schema.string().min(1);
 
 const ReasonArgs = {
@@ -90,6 +94,13 @@ interface FocusedTaskContext {
   goal: GoalRecord;
   task: GoalTask;
   taskList: GoalTaskList;
+}
+
+interface RecentCommandResult {
+  signature: string;
+  text: string;
+  shouldAutoContinue: boolean;
+  createdAt: number;
 }
 
 type CommandContextInput = Omit<ExecutionContextCandidate, "source" | "timestamp">;
@@ -110,6 +121,8 @@ export class GoalRuntime {
   private readonly continuationInFlight = new Set<string>();
   private readonly auditorSessionGoals = new Map<string, string>();
   private readonly lastEvaluatedContinuation = new Map<string, number>();
+  private readonly recentCommandResults = new Map<string, RecentCommandResult>();
+  private readonly commandInterruptionIgnoreUntil = new Map<string, number>();
 
   constructor(input: PluginInput, rawOptions: unknown) {
     this.input = input;
@@ -158,6 +171,8 @@ export class GoalRuntime {
     for (const timerState of this.continuationTimers.values()) clearTimeout(timerState.timer);
     this.continuationTimers.clear();
     this.continuationInFlight.clear();
+    this.recentCommandResults.clear();
+    this.commandInterruptionIgnoreUntil.clear();
   }
 
   private appendGoalSystemContext(sessionID: MaybeUndefined<string>, system: string[]): void {
@@ -188,34 +203,48 @@ export class GoalRuntime {
   private registerCommands(config: Config): void {
     if (config.command === undefined) config.command = {};
     const commandName = this.options.commandName;
-    config.command[commandName] = {
+    this.registerCommandAliases(config, commandName, {
       description: "Draft a durable opencode-goal-x objective for explicit confirmation, or manage existing goals.",
       template: "$ARGUMENTS",
-    };
-    config.command[`${commandName}-set`] = {
+    });
+    this.registerCommandAliases(config, `${commandName}-set`, {
       description: "Start a durable opencode-goal-x objective immediately.",
       template: "$ARGUMENTS",
-    };
-    config.command[`${commandName}-confirm`] = {
+    });
+    this.registerCommandAliases(config, `${commandName}-confirm`, {
       description: "Confirm the latest drafted opencode-goal-x objective and start it.",
       template: "$ARGUMENTS",
-    };
-    config.command[`${commandName}-reject`] = {
+    });
+    this.registerCommandAliases(config, `${commandName}-reject`, {
       description: "Discard the latest drafted opencode-goal-x objective without creating a goal.",
       template: "$ARGUMENTS",
-    };
-    config.command[`${commandName}-status`] = { description: "Show the focused goal status.", template: "$ARGUMENTS" };
-    config.command[`${commandName}-list`] = { description: "List open goals.", template: "$ARGUMENTS" };
-    config.command[`${commandName}-focus`] = { description: "Focus an open goal by number or id.", template: "$ARGUMENTS" };
-    config.command[`${commandName}-pause`] = { description: "Pause the focused goal.", template: "$ARGUMENTS" };
-    config.command[`${commandName}-resume`] = { description: "Resume the focused paused goal.", template: "$ARGUMENTS" };
-    config.command[`${commandName}-tweak`] = { description: "Revise the focused goal objective.", template: "$ARGUMENTS" };
-    config.command[`${commandName}-abort`] = { description: "Abort and archive the focused goal.", template: "$ARGUMENTS" };
-    config.command[`${commandName}-clear`] = { description: "Clear and archive the focused goal.", template: "$ARGUMENTS" };
+    });
+    this.registerCommandAliases(config, `${commandName}-status`, { description: "Show the focused goal status.", template: "$ARGUMENTS" });
+    this.registerCommandAliases(config, `${commandName}-list`, { description: "List open goals.", template: "$ARGUMENTS" });
+    this.registerCommandAliases(config, `${commandName}-focus`, { description: "Focus an open goal by number or id.", template: "$ARGUMENTS" });
+    this.registerCommandAliases(config, `${commandName}-pause`, { description: "Pause the focused goal.", template: "$ARGUMENTS" });
+    this.registerCommandAliases(config, `${commandName}-resume`, { description: "Resume the focused paused goal.", template: "$ARGUMENTS" });
+    this.registerCommandAliases(config, `${commandName}-tweak`, { description: "Revise the focused goal objective.", template: "$ARGUMENTS" });
+    this.registerCommandAliases(config, `${commandName}-abort`, { description: "Abort and archive the focused goal.", template: "$ARGUMENTS" });
+    this.registerCommandAliases(config, `${commandName}-clear`, { description: "Clear and archive the focused goal.", template: "$ARGUMENTS" });
+  }
+
+  private registerCommandAliases(config: Config, command: string, definition: NonNullable<Config["command"]>[string]): void {
+    if (config.command === undefined) config.command = {};
+    config.command[command] = definition;
+    const suffix = command.slice(this.options.commandName.length);
+    for (const alias of goalCommandAliases(this.options.commandName)) config.command[`${alias}${suffix}`] = definition;
   }
 
   private async handleCommand(command: string, sessionID: string, rawArguments: string, parts: MutableTextPart[]): Promise<void> {
     if (this.ownsCommand(command) === false) return;
+    const signature = commandSignature(command, rawArguments);
+    const cached = this.recentCommandResult(sessionID, signature);
+    if (cached !== undefined) {
+      this.replaceCommandText(parts, cached.text);
+      return;
+    }
+
     this.refreshStore();
     const parsed = parseGoalCommand(command, this.options.commandName, rawArguments);
     if (parsed.ok === false) {
@@ -226,13 +255,39 @@ export class GoalRuntime {
 
     const result = await this.executeParsedCommand(sessionID, parsed.value);
     this.replaceCommandText(parts, result.text);
+    this.rememberCommandResult(sessionID, signature, result);
     await this.toast(result.text.split("\n")[0] ?? "opencode-goal-x", "info");
-    if (result.shouldAutoContinue) this.queueContinuation(sessionID, "command");
+    if (result.shouldAutoContinue) {
+      this.ignoreCommandInterruption(sessionID);
+      this.queueContinuation(sessionID, "command");
+    }
+  }
+
+  private recentCommandResult(sessionID: string, signature: string): MaybeUndefined<RecentCommandResult> {
+    const cached = this.recentCommandResults.get(sessionID);
+    if (cached === undefined) return undefined;
+    if (cached.signature !== signature) return undefined;
+    if (Date.now() - cached.createdAt > COMMAND_DEDUPE_MS) return undefined;
+    return cached;
+  }
+
+  private rememberCommandResult(sessionID: string, signature: string, result: CommandExecutionResult): void {
+    this.recentCommandResults.set(sessionID, {
+      signature,
+      text: result.text,
+      shouldAutoContinue: result.shouldAutoContinue,
+      createdAt: Date.now(),
+    });
+  }
+
+  private ignoreCommandInterruption(sessionID: string): void {
+    this.commandInterruptionIgnoreUntil.set(sessionID, Date.now() + COMMAND_INTERRUPTION_IGNORE_MS);
   }
 
   private ownsCommand(command: string): boolean {
     const base = this.options.commandName;
-    return command === base || command.startsWith(`${base}-`);
+    if (command === base || command.startsWith(`${base}-`)) return true;
+    return goalCommandAliases(base).some((alias) => command === alias || command.startsWith(`${alias}-`));
   }
 
   private replaceCommandText(parts: MutableTextPart[], text: string): void {
@@ -300,6 +355,12 @@ export class GoalRuntime {
 
   private startGoalDraftCommand(sessionID: string, command: { objective?: string; successCriteria?: string; constraints?: string; verificationContract?: string; budgetOverrides: Partial<GoalBudget> }): string {
     if (command.objective === undefined) return "Goal draft topic is empty.";
+    const existingDraft = this.matchingSessionDraft(sessionID, command.objective);
+    if (existingDraft !== undefined) {
+      if (existingDraft.status === "proposed") return formatGoalDraftConfirmation(existingDraft);
+      return this.formatDraftRequest(existingDraft);
+    }
+
     const draft = createGoalDraft({
       sessionID,
       topic: command.objective,
@@ -312,6 +373,10 @@ export class GoalRuntime {
       status: "planning",
     });
     this.persistDraft(draft, sessionID, "goal_draft_requested");
+    return this.formatDraftRequest(draft);
+  }
+
+  private formatDraftRequest(draft: Pick<GoalDraft, "id" | "status" | "topic">): string {
     return [
       "Goal drafting started. No goal has been created and no implementation should start yet.",
       "",
@@ -323,9 +388,18 @@ export class GoalRuntime {
   }
 
   private confirmGoalDraftCommand(sessionID: string, selector: MaybeUndefined<string>): string {
-    const draft = findSessionDraft(this.store.drafts, sessionID, cleanOptionalText(selector));
-    if (draft === undefined) return "No pending goal draft to confirm.";
-    if (draft.status !== "proposed") return "No finalized goal draft to confirm. Continue the discussion until the assistant calls propose_goal_draft with the finalized objective.";
+    const draftID = cleanOptionalText(selector);
+    const draft = findSessionDraft(this.store.drafts, sessionID, draftID);
+    if (draft === undefined) {
+      const confirmedGoal = this.confirmedDraftGoal(sessionID, draftID);
+      if (confirmedGoal !== undefined) return this.alreadyConfirmedText(confirmedGoal);
+      return "No pending goal draft to confirm.";
+    }
+    if (draft.status !== "proposed") {
+      const confirmedGoal = this.confirmedDraftGoal(sessionID, draftID);
+      if (confirmedGoal !== undefined) return this.alreadyConfirmedText(confirmedGoal);
+      return "No finalized goal draft to confirm. Continue the discussion until the assistant calls propose_goal_draft with the finalized objective.";
+    }
     const goal = createGoal({
       objective: draft.objective,
       sessionID,
@@ -341,11 +415,69 @@ export class GoalRuntime {
     return `Goal draft confirmed.\n\n${summarizeGoal(saved)}\n\nThe auto-continue loop is armed.`;
   }
 
+  private alreadyConfirmedText(goal: GoalRecord): string {
+    return `Goal draft already confirmed.\n\n${summarizeGoal(goal)}\n\nThe auto-continue loop is armed.`;
+  }
+
   private rejectGoalDraftCommand(sessionID: string, selector: MaybeUndefined<string>): string {
-    const draft = findSessionDraft(this.store.drafts, sessionID, cleanOptionalText(selector));
-    if (draft === undefined) return "No pending goal draft to reject.";
+    const draftID = cleanOptionalText(selector);
+    const draft = findSessionDraft(this.store.drafts, sessionID, draftID);
+    if (draft === undefined) {
+      if (draftID !== undefined && this.wasDraftRejected(sessionID, draftID)) return `Goal draft already rejected. No goal was created. Draft ID: ${draftID}`;
+      return "No pending goal draft to reject.";
+    }
     this.removeDraftRecord(draft.id, sessionID, "goal_draft_rejected");
     return `Goal draft rejected. No goal was created. Draft ID: ${draft.id}`;
+  }
+
+  private matchingSessionDraft(sessionID: string, objective: string): MaybeUndefined<GoalDraft> {
+    const objectiveText = objective.trim();
+    if (objectiveText.length === 0) return undefined;
+    if (this.store.drafts === undefined) return undefined;
+    let latest: MaybeUndefined<GoalDraft>;
+    for (const draft of Object.values(this.store.drafts)) {
+      if (draft.sessionID !== sessionID) continue;
+      if (draft.objective !== objectiveText) continue;
+      if (latest === undefined) {
+        latest = draft;
+        continue;
+      }
+      if (draft.updatedAt > latest.updatedAt) latest = draft;
+    }
+    return latest;
+  }
+
+  private confirmedDraftGoal(sessionID: string, draftID: MaybeUndefined<string>): MaybeUndefined<GoalRecord> {
+    const recentEvents = readLedgerEvents(this.paths, 200);
+    for (let index = recentEvents.length - 1; index >= 0; index -= 1) {
+      const event = recentEvents[index];
+      if (event === undefined) continue;
+      if (ledgerText(event, "type") !== "goal_draft_confirmed") continue;
+      if (ledgerText(event, "sessionID") !== sessionID) continue;
+      if (draftID !== undefined && ledgerText(event, "draftId") !== draftID) continue;
+      if (draftID === undefined && isRecentLedgerEvent(event, RECENT_DRAFT_CONFIRM_MS) === false) continue;
+      const goalID = ledgerText(event, "goalId");
+      if (goalID === undefined) continue;
+      const goal = this.store.goals.find((candidate) => candidate.id === goalID);
+      if (goal === undefined) continue;
+      this.store = focusGoal(this.store, sessionID, goal.id);
+      saveStore(this.paths, this.store);
+      return goal;
+    }
+    return undefined;
+  }
+
+  private wasDraftRejected(sessionID: string, draftID: string): boolean {
+    const recentEvents = readLedgerEvents(this.paths, 200);
+    for (let index = recentEvents.length - 1; index >= 0; index -= 1) {
+      const event = recentEvents[index];
+      if (event === undefined) continue;
+      if (ledgerText(event, "type") !== "goal_draft_rejected") continue;
+      if (ledgerText(event, "sessionID") !== sessionID) continue;
+      if (ledgerText(event, "draftId") !== draftID) continue;
+      return true;
+    }
+    return false;
   }
 
   private focusGoalCommand(sessionID: string, selector: MaybeUndefined<string>): string {
@@ -537,6 +669,7 @@ export class GoalRuntime {
   }
 
   private handleUserInterruption(sessionID: string, messageID: string): void {
+    if (this.shouldIgnoreCommandInterruption(sessionID)) return;
     if (this.continuationTimers.has(sessionID) === false && this.continuationInFlight.has(sessionID) === false) return;
     const goal = this.autoContinuingGoal(sessionID);
     if (goal === undefined) return;
@@ -548,6 +681,14 @@ export class GoalRuntime {
     this.persistGoal(next, sessionID, "goal_user_interrupted");
     this.clearContinuation(sessionID);
     appendLedger(this.paths, { type: "goal_user_interruption_detail", goalId: goal.id, sessionID, messageID });
+  }
+
+  private shouldIgnoreCommandInterruption(sessionID: string): boolean {
+    const ignoreUntil = this.commandInterruptionIgnoreUntil.get(sessionID);
+    if (ignoreUntil === undefined) return false;
+    if (Date.now() <= ignoreUntil) return true;
+    this.commandInterruptionIgnoreUntil.delete(sessionID);
+    return false;
   }
 
   private syncTodos(sessionID: string, todos: unknown): void {
@@ -796,7 +937,9 @@ export class GoalRuntime {
             status: "proposed",
           });
           this.persistDraft(draft, context.sessionID, "goal_draft_proposed");
-          return formatGoalDraftConfirmation(draft);
+          const confirmation = formatGoalDraftConfirmation(draft);
+          await this.toast(`Goal draft ready. Confirm with /${this.options.commandName}-confirm ${draft.id}`, "success");
+          return `Show this confirmation to the user:\n\n${confirmation}`;
         },
       }),
       propose_goal_tweak: tool({
@@ -1197,6 +1340,24 @@ function skipTaskUpdate(reason: string): (task: GoalTask) => GoalTask {
 
 function taskStatusUpdate(updates: Partial<GoalTask>): (task: GoalTask) => GoalTask {
   return (task) => ({ ...task, ...updates });
+}
+
+function commandSignature(command: string, rawArguments: string): string {
+  return `${command}\u0000${rawArguments}`;
+}
+
+function ledgerText(event: UnknownRecord, field: string): MaybeUndefined<string> {
+  const value = event[field];
+  if (typeof value !== "string") return undefined;
+  return value;
+}
+
+function isRecentLedgerEvent(event: UnknownRecord, maxAgeMs: number): boolean {
+  const at = ledgerText(event, "at");
+  if (at === undefined) return false;
+  const timestamp = Date.parse(at);
+  if (Number.isNaN(timestamp)) return false;
+  return Date.now() - timestamp <= maxAgeMs;
 }
 
 function helpText(commandName: string): string {

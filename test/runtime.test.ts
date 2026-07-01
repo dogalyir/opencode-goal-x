@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createOpencodeClient, type Part } from "@opencode-ai/sdk";
-import { tool, type Hooks, type PluginInput } from "@opencode-ai/plugin";
+import { tool, type Config, type Hooks, type PluginInput } from "@opencode-ai/plugin";
 import type { ToolContext } from "@opencode-ai/plugin/tool";
 import { focusGoal } from "../src/goal";
 import { createGoalRuntime } from "../src/runtime";
@@ -30,12 +30,53 @@ describe("GoalRuntime integration-style behavior", () => {
     await setup.runtime.disposeForTest();
   });
 
+  test("duplicate /goal command hooks do not create duplicate planning drafts", async () => {
+    const setup = createRuntimeSetup({ requireAudit: false });
+    const commandHook = requireCommandHook(setup.hooks);
+    const firstParts = textParts();
+    const secondParts = textParts();
+
+    await commandHook({ command: "goal", sessionID: "s1", arguments: "draft once" }, { parts: firstParts });
+    await commandHook({ command: "goal", sessionID: "s1", arguments: "draft once" }, { parts: secondParts });
+    const store = loadStore(setup.paths);
+
+    expect(Object.values(store.drafts ?? {})).toHaveLength(1);
+    expect(firstText(secondParts)).toContain("Goal drafting started");
+    await setup.runtime.disposeForTest();
+  });
+
+  test("plural /goals alias is registered and creates a confirmable draft flow", async () => {
+    const setup = createRuntimeSetup({ requireAudit: false });
+    const commandHook = requireCommandHook(setup.hooks);
+    const configHook = requireConfigHook(setup.hooks);
+    const config: Config = {};
+    const parts = textParts();
+
+    await configHook(config);
+    expect(config.command?.goals).toBeDefined();
+    expect(config.command?.["goals-confirm"]).toBeDefined();
+
+    await commandHook({ command: "goals", sessionID: "s1", arguments: "draft from plural alias" }, { parts });
+    const afterDraft = loadStore(setup.paths);
+    expect(firstDraft(afterDraft).status).toBe("planning");
+
+    const proposeDraft = requireTool(setup.hooks, "propose_goal_draft");
+    await proposeDraft.execute({ objective: "draft from plural alias" }, toolContext(setup.directory));
+    await commandHook({ command: "goals-confirm", sessionID: "s1", arguments: "" }, { parts });
+
+    const store = loadStore(setup.paths);
+    expect(firstText(parts)).toContain("Goal draft confirmed");
+    expect(store.goals).toHaveLength(1);
+    await setup.runtime.disposeForTest();
+  });
+
   test("propose_goal_draft creates a finalized draft that /goal-confirm starts", async () => {
     const setup = createRuntimeSetup({ requireAudit: false });
     const proposeDraft = requireTool(setup.hooks, "propose_goal_draft");
     const commandHook = requireCommandHook(setup.hooks);
 
     const draftText = await proposeDraft.execute({ objective: "Finalize and verify a change" }, toolContext(setup.directory));
+    expect(String(draftText)).toContain("Show this confirmation to the user");
     expect(String(draftText)).toContain("No goal has been created yet");
 
     const parts = textParts();
@@ -47,6 +88,52 @@ describe("GoalRuntime integration-style behavior", () => {
     expect(store.goals).toHaveLength(1);
     expect(goal.status).toBe("active");
     expect(store.focusBySession.s1).toBe(goal.id);
+    await setup.runtime.disposeForTest();
+  });
+
+  test("duplicate /goal-confirm for the same draft remains successful and creates one goal", async () => {
+    const setup = createRuntimeSetup({ requireAudit: false });
+    const proposeDraft = requireTool(setup.hooks, "propose_goal_draft");
+    const commandHook = requireCommandHook(setup.hooks);
+
+    await proposeDraft.execute({ objective: "Confirm only once" }, toolContext(setup.directory));
+    const draftID = firstDraft(loadStore(setup.paths)).id;
+    const firstParts = textParts();
+    const secondParts = textParts();
+
+    await commandHook({ command: "goal-confirm", sessionID: "s1", arguments: draftID }, { parts: firstParts });
+    await commandHook({ command: "goal-confirm", sessionID: "s1", arguments: `${draftID} ` }, { parts: secondParts });
+    const store = loadStore(setup.paths);
+
+    expect(firstText(firstParts)).toContain("Goal draft confirmed");
+    expect(firstText(secondParts)).toContain("Goal draft already confirmed");
+    expect(store.goals).toHaveLength(1);
+    await setup.runtime.disposeForTest();
+  });
+
+  test("command-origin chat message does not pause a newly confirmed goal", async () => {
+    const setup = createRuntimeSetup({ requireAudit: false, minDelayMs: 60_000 });
+    const proposeDraft = requireTool(setup.hooks, "propose_goal_draft");
+    const commandHook = requireCommandHook(setup.hooks);
+    const chatHook = requireChatHook(setup.hooks);
+
+    await proposeDraft.execute({ objective: "Stay active after confirm" }, toolContext(setup.directory));
+    await commandHook({ command: "goal-confirm", sessionID: "s1", arguments: "" }, { parts: textParts() });
+    await chatHook({ sessionID: "s1" }, {
+      message: {
+        id: "confirm-message",
+        sessionID: "s1",
+        role: "user",
+        time: { created: Date.now() },
+        agent: "build",
+        model: { providerID: "mock-provider", modelID: "mock-model" },
+      },
+      parts: textParts(),
+    });
+    const store = loadStore(setup.paths);
+    const goal = goalAt(store, 0);
+
+    expect(goal.status).toBe("active");
     await setup.runtime.disposeForTest();
   });
 
@@ -318,6 +405,18 @@ function toolContext(directory: string): ToolContext {
 function requireCommandHook(hooks: Hooks): NonNullable<Hooks["command.execute.before"]> {
   const hook = hooks["command.execute.before"];
   if (hook === undefined) throw new Error("command hook missing");
+  return hook;
+}
+
+function requireChatHook(hooks: Hooks): NonNullable<Hooks["chat.message"]> {
+  const hook = hooks["chat.message"];
+  if (hook === undefined) throw new Error("chat hook missing");
+  return hook;
+}
+
+function requireConfigHook(hooks: Hooks): NonNullable<Hooks["config"]> {
+  const hook = hooks.config;
+  if (hook === undefined) throw new Error("config hook missing");
   return hook;
 }
 
