@@ -1,8 +1,8 @@
 # opencode-goal-x
 
-OpenCode-native durable goals with confirmation-first drafting, autoContinue, task contracts, OpenCode todo awareness, compaction continuity, visible TUI status, and fail-closed independent completion audits.
+opencode-goal-x is an OpenCode plugin for managing persistent AI objectives across sessions. It adds confirmation-first goal drafting, guarded automatic continuations, OpenCode todo synchronization, compact TUI visibility, context preservation, and fail-closed completion audits.
 
-Goal X is not a direct Pi port and does not implement Sisyphus as a primary mode. It uses OpenCode server-plugin hooks, native sessions, command hooks, compaction hooks, custom tools, state files, and a target-exclusive TUI plugin module.
+Goal X is built directly on OpenCode server-plugin hooks, native sessions, command hooks, compaction hooks, custom tools, state files, and a target-exclusive TUI plugin module.
 
 ## Package Targets
 
@@ -14,7 +14,9 @@ This package keeps the default export compatible with existing server-plugin loa
 
 Current minimum assumed OpenCode/API version: `>=1.17.11` (`@opencode-ai/plugin` and `@opencode-ai/sdk` in this repo). Restart OpenCode after changing plugin code, package exports, or config; plugins are loaded at startup.
 
-The package still has `private: true` while this repository is under active productization. `publishConfig.access` and target exports are present so publishing can be enabled by removing `private` after final smoke testing.
+Publishing is handled by `.github/workflows/publish.yml` when a GitHub Release is published. The release tag must match `package.json` as `v<version>`.
+
+For the first npm publish, publish once manually, then configure npm Trusted Publishing for `dogalyir/opencode-goal-x`, workflow file `publish.yml`, environment `npm`, with `npm publish` allowed. npm requires the package to exist before a trusted publisher can be attached.
 
 ## Features
 
