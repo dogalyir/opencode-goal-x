@@ -173,6 +173,8 @@ export interface GoalPaths {
 export interface GoalRuntimeOptions extends GoalBudget {
   commandName: string;
   stateDir: string;
+  planningAgent: string;
+  executionAgent: string;
   requireAudit: boolean;
   auditTimeoutMs: number;
   auditorModel?: string;

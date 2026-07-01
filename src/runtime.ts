@@ -205,14 +205,17 @@ export class GoalRuntime {
     const commandName = this.options.commandName;
     this.registerCommand(config, commandName, {
       description: "Draft a durable opencode-goal-x objective for explicit confirmation, or manage existing goals.",
+      agent: this.options.planningAgent,
       template: "$ARGUMENTS",
     });
     this.registerCommand(config, `${commandName}-set`, {
       description: "Start a durable opencode-goal-x objective immediately.",
+      agent: this.options.executionAgent,
       template: "$ARGUMENTS",
     });
     this.registerCommand(config, `${commandName}-confirm`, {
       description: "Confirm the latest drafted opencode-goal-x objective and start it.",
+      agent: this.options.executionAgent,
       template: "$ARGUMENTS",
     });
     this.registerCommand(config, `${commandName}-reject`, {
@@ -223,7 +226,7 @@ export class GoalRuntime {
     this.registerCommand(config, `${commandName}-list`, { description: "List open goals.", template: "$ARGUMENTS" });
     this.registerCommand(config, `${commandName}-focus`, { description: "Focus an open goal by number or id.", template: "$ARGUMENTS" });
     this.registerCommand(config, `${commandName}-pause`, { description: "Pause the focused goal.", template: "$ARGUMENTS" });
-    this.registerCommand(config, `${commandName}-resume`, { description: "Resume the focused paused goal.", template: "$ARGUMENTS" });
+    this.registerCommand(config, `${commandName}-resume`, { description: "Resume the focused paused goal.", agent: this.options.executionAgent, template: "$ARGUMENTS" });
     this.registerCommand(config, `${commandName}-tweak`, { description: "Revise the focused goal objective.", template: "$ARGUMENTS" });
     this.registerCommand(config, `${commandName}-abort`, { description: "Abort and archive the focused goal.", template: "$ARGUMENTS" });
     this.registerCommand(config, `${commandName}-clear`, { description: "Clear and archive the focused goal.", template: "$ARGUMENTS" });
