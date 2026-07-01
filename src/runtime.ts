@@ -1,6 +1,6 @@
 import { tool, type Config, type Hooks, type PluginInput } from "@opencode-ai/plugin";
 import { runCompletionAudit } from "./audit";
-import { goalCommandAliases, parseGoalCommand } from "./commands";
+import { parseGoalCommand } from "./commands";
 import { createGoalDraft, findSessionDraft, formatGoalDraftConfirmation, formatGoalDraftHeaderLines, removeDraft, upsertDraft } from "./draft";
 import { DEFAULT_OPTIONS, MEANINGFUL_PROGRESS_TOOLS, PLUGIN_NAME } from "./defaults";
 import { errorMessage } from "./errors";
@@ -203,37 +203,35 @@ export class GoalRuntime {
   private registerCommands(config: Config): void {
     if (config.command === undefined) config.command = {};
     const commandName = this.options.commandName;
-    this.registerCommandAliases(config, commandName, {
+    this.registerCommand(config, commandName, {
       description: "Draft a durable opencode-goal-x objective for explicit confirmation, or manage existing goals.",
       template: "$ARGUMENTS",
     });
-    this.registerCommandAliases(config, `${commandName}-set`, {
+    this.registerCommand(config, `${commandName}-set`, {
       description: "Start a durable opencode-goal-x objective immediately.",
       template: "$ARGUMENTS",
     });
-    this.registerCommandAliases(config, `${commandName}-confirm`, {
+    this.registerCommand(config, `${commandName}-confirm`, {
       description: "Confirm the latest drafted opencode-goal-x objective and start it.",
       template: "$ARGUMENTS",
     });
-    this.registerCommandAliases(config, `${commandName}-reject`, {
+    this.registerCommand(config, `${commandName}-reject`, {
       description: "Discard the latest drafted opencode-goal-x objective without creating a goal.",
       template: "$ARGUMENTS",
     });
-    this.registerCommandAliases(config, `${commandName}-status`, { description: "Show the focused goal status.", template: "$ARGUMENTS" });
-    this.registerCommandAliases(config, `${commandName}-list`, { description: "List open goals.", template: "$ARGUMENTS" });
-    this.registerCommandAliases(config, `${commandName}-focus`, { description: "Focus an open goal by number or id.", template: "$ARGUMENTS" });
-    this.registerCommandAliases(config, `${commandName}-pause`, { description: "Pause the focused goal.", template: "$ARGUMENTS" });
-    this.registerCommandAliases(config, `${commandName}-resume`, { description: "Resume the focused paused goal.", template: "$ARGUMENTS" });
-    this.registerCommandAliases(config, `${commandName}-tweak`, { description: "Revise the focused goal objective.", template: "$ARGUMENTS" });
-    this.registerCommandAliases(config, `${commandName}-abort`, { description: "Abort and archive the focused goal.", template: "$ARGUMENTS" });
-    this.registerCommandAliases(config, `${commandName}-clear`, { description: "Clear and archive the focused goal.", template: "$ARGUMENTS" });
+    this.registerCommand(config, `${commandName}-status`, { description: "Show the focused goal status.", template: "$ARGUMENTS" });
+    this.registerCommand(config, `${commandName}-list`, { description: "List open goals.", template: "$ARGUMENTS" });
+    this.registerCommand(config, `${commandName}-focus`, { description: "Focus an open goal by number or id.", template: "$ARGUMENTS" });
+    this.registerCommand(config, `${commandName}-pause`, { description: "Pause the focused goal.", template: "$ARGUMENTS" });
+    this.registerCommand(config, `${commandName}-resume`, { description: "Resume the focused paused goal.", template: "$ARGUMENTS" });
+    this.registerCommand(config, `${commandName}-tweak`, { description: "Revise the focused goal objective.", template: "$ARGUMENTS" });
+    this.registerCommand(config, `${commandName}-abort`, { description: "Abort and archive the focused goal.", template: "$ARGUMENTS" });
+    this.registerCommand(config, `${commandName}-clear`, { description: "Clear and archive the focused goal.", template: "$ARGUMENTS" });
   }
 
-  private registerCommandAliases(config: Config, command: string, definition: NonNullable<Config["command"]>[string]): void {
+  private registerCommand(config: Config, command: string, definition: NonNullable<Config["command"]>[string]): void {
     if (config.command === undefined) config.command = {};
     config.command[command] = definition;
-    const suffix = command.slice(this.options.commandName.length);
-    for (const alias of goalCommandAliases(this.options.commandName)) config.command[`${alias}${suffix}`] = definition;
   }
 
   private async handleCommand(command: string, sessionID: string, rawArguments: string, parts: MutableTextPart[]): Promise<void> {
@@ -286,8 +284,7 @@ export class GoalRuntime {
 
   private ownsCommand(command: string): boolean {
     const base = this.options.commandName;
-    if (command === base || command.startsWith(`${base}-`)) return true;
-    return goalCommandAliases(base).some((alias) => command === alias || command.startsWith(`${alias}-`));
+    return command === base || command.startsWith(`${base}-`);
   }
 
   private replaceCommandText(parts: MutableTextPart[], text: string): void {

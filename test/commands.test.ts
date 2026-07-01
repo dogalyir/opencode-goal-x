@@ -28,14 +28,13 @@ describe("goal command parser", () => {
     expect(command.budgetOverrides.maxTurns).toBe(2);
   });
 
-  test("parses plural /goals aliases like /goal", () => {
-    const draft = requireParseSuccess(parseGoalCommand("goals", "goal", "draft with plural alias"));
-    const confirm = requireParseSuccess(parseGoalCommand("goals-confirm", "goal", "draft-1"));
+  test("does not normalize plural lifecycle command aliases", () => {
+    const parsed = parseGoalCommand("goals-confirm", "goal", "draft-1");
 
-    expect(draft.action).toBe("draft");
-    expect(draft.objective).toBe("draft with plural alias");
-    expect(confirm.action).toBe("confirm");
-    expect(confirm.goalId).toBe("draft-1");
+    const command = requireParseSuccess(parsed);
+    expect(command.action).toBe("draft");
+    expect(command.objective).toBe("draft-1");
+    expect(command.goalId).toBeUndefined();
   });
 
   test("maps draft confirmation commands", () => {

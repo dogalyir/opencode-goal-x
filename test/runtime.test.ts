@@ -45,27 +45,37 @@ describe("GoalRuntime integration-style behavior", () => {
     await setup.runtime.disposeForTest();
   });
 
-  test("plural /goals alias is registered and creates a confirmable draft flow", async () => {
+  test("default command registration and ownership are singular-only", async () => {
     const setup = createRuntimeSetup({ requireAudit: false });
     const commandHook = requireCommandHook(setup.hooks);
     const configHook = requireConfigHook(setup.hooks);
     const config: Config = {};
-    const parts = textParts();
 
     await configHook(config);
-    expect(config.command?.goals).toBeDefined();
-    expect(config.command?.["goals-confirm"]).toBeDefined();
+    expect(config.command?.goal).toBeDefined();
+    expect(config.command?.["goal-confirm"]).toBeDefined();
+    expect(config.command?.goals).toBeUndefined();
+    expect(config.command?.["goals-confirm"]).toBeUndefined();
 
-    await commandHook({ command: "goals", sessionID: "s1", arguments: "draft from plural alias" }, { parts });
-    const afterDraft = loadStore(setup.paths);
-    expect(firstDraft(afterDraft).status).toBe("planning");
+    const pluralDraftParts = textParts();
+    await commandHook({ command: "goals", sessionID: "s1", arguments: "draft from plural alias" }, { parts: pluralDraftParts });
+    const afterPluralDraft = loadStore(setup.paths);
+    expect(Object.values(afterPluralDraft.drafts ?? {})).toHaveLength(0);
+    expect(firstText(pluralDraftParts)).toBe("");
 
     const proposeDraft = requireTool(setup.hooks, "propose_goal_draft");
     await proposeDraft.execute({ objective: "draft from plural alias" }, toolContext(setup.directory));
-    await commandHook({ command: "goals-confirm", sessionID: "s1", arguments: "" }, { parts });
+    const pluralConfirmParts = textParts();
+    await commandHook({ command: "goals-confirm", sessionID: "s1", arguments: "" }, { parts: pluralConfirmParts });
+    const afterPluralConfirm = loadStore(setup.paths);
+    expect(firstText(pluralConfirmParts)).toBe("");
+    expect(afterPluralConfirm.goals).toHaveLength(0);
+
+    const singularConfirmParts = textParts();
+    await commandHook({ command: "goal-confirm", sessionID: "s1", arguments: "" }, { parts: singularConfirmParts });
 
     const store = loadStore(setup.paths);
-    expect(firstText(parts)).toContain("Goal draft confirmed");
+    expect(firstText(singularConfirmParts)).toContain("Goal draft confirmed");
     expect(store.goals).toHaveLength(1);
     await setup.runtime.disposeForTest();
   });

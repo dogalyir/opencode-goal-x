@@ -39,19 +39,18 @@ export function parseGoalCommand(commandName: string, defaultCommandName: string
   const tokensResult = splitCommandLine(rawArguments);
   if (tokensResult.ok === false) return tokensResult;
   const tokens = tokensResult.value;
-  const normalizedCommandName = normalizeGoalCommandName(commandName, defaultCommandName);
 
-  if (normalizedCommandName === `${defaultCommandName}-status`) return okCommand("status");
-  if (normalizedCommandName === `${defaultCommandName}-list`) return okCommand("list");
-  if (normalizedCommandName === `${defaultCommandName}-pause`) return okCommand("pause", { reason: rawArguments });
-  if (normalizedCommandName === `${defaultCommandName}-resume`) return okCommand("resume");
-  if (normalizedCommandName === `${defaultCommandName}-clear`) return okCommand("clear");
-  if (normalizedCommandName === `${defaultCommandName}-abort`) return okCommand("abort", { reason: rawArguments });
-  if (normalizedCommandName === `${defaultCommandName}-focus`) return okCommand("focus", { goalId: rawArguments.trim() });
-  if (normalizedCommandName === `${defaultCommandName}-tweak`) return okCommand("tweak", { objective: rawArguments.trim() });
-  if (normalizedCommandName === `${defaultCommandName}-confirm`) return okCommand("confirm", { goalId: rawArguments.trim() });
-  if (normalizedCommandName === `${defaultCommandName}-reject`) return okCommand("reject", { goalId: rawArguments.trim() });
-  if (normalizedCommandName === `${defaultCommandName}-set`) return parseStart(tokens);
+  if (commandName === `${defaultCommandName}-status`) return okCommand("status");
+  if (commandName === `${defaultCommandName}-list`) return okCommand("list");
+  if (commandName === `${defaultCommandName}-pause`) return okCommand("pause", { reason: rawArguments });
+  if (commandName === `${defaultCommandName}-resume`) return okCommand("resume");
+  if (commandName === `${defaultCommandName}-clear`) return okCommand("clear");
+  if (commandName === `${defaultCommandName}-abort`) return okCommand("abort", { reason: rawArguments });
+  if (commandName === `${defaultCommandName}-focus`) return okCommand("focus", { goalId: rawArguments.trim() });
+  if (commandName === `${defaultCommandName}-tweak`) return okCommand("tweak", { objective: rawArguments.trim() });
+  if (commandName === `${defaultCommandName}-confirm`) return okCommand("confirm", { goalId: rawArguments.trim() });
+  if (commandName === `${defaultCommandName}-reject`) return okCommand("reject", { goalId: rawArguments.trim() });
+  if (commandName === `${defaultCommandName}-set`) return parseStart(tokens);
 
   if (tokens.length === 0) return okCommand("status");
   const first = tokens[0];
@@ -72,18 +71,6 @@ export function parseGoalCommand(commandName: string, defaultCommandName: string
   if (HELP_WORDS.has(lowerFirst)) return okCommand("help");
 
   return parseDraft(tokens);
-}
-
-export function goalCommandAliases(commandName: string): string[] {
-  return commandName.endsWith("s") ? [] : [`${commandName}s`];
-}
-
-function normalizeGoalCommandName(commandName: string, defaultCommandName: string): string {
-  for (const alias of goalCommandAliases(defaultCommandName)) {
-    if (commandName === alias) return defaultCommandName;
-    if (commandName.startsWith(`${alias}-`)) return `${defaultCommandName}${commandName.slice(alias.length)}`;
-  }
-  return commandName;
 }
 
 function parseDraft(tokens: string[]): OperationResult<ParsedGoalCommand> {
