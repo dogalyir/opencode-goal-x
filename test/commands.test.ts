@@ -28,6 +28,16 @@ describe("goal command parser", () => {
     expect(command.budgetOverrides.maxTurns).toBe(2);
   });
 
+  test("parses plural /goals aliases like /goal", () => {
+    const draft = requireParseSuccess(parseGoalCommand("goals", "goal", "draft with plural alias"));
+    const confirm = requireParseSuccess(parseGoalCommand("goals-confirm", "goal", "draft-1"));
+
+    expect(draft.action).toBe("draft");
+    expect(draft.objective).toBe("draft with plural alias");
+    expect(confirm.action).toBe("confirm");
+    expect(confirm.goalId).toBe("draft-1");
+  });
+
   test("maps draft confirmation commands", () => {
     const parsed = parseGoalCommand("goal-confirm", "goal", "draft-1");
 
@@ -43,10 +53,33 @@ describe("goal command parser", () => {
     expect(command.action).toBe("resume");
   });
 
-  test("rejects unknown flags", () => {
+  test("keeps unknown flags in free-form goal text", () => {
     const parsed = parseGoalCommand("goal", "goal", "ship it --wat nope");
 
-    expect(expectParseFailure(parsed)).toContain("Unknown goal flag");
+    const command = requireParseSuccess(parsed);
+    expect(command.action).toBe("draft");
+    expect(command.objective).toBe("ship it --wat nope");
+  });
+
+  test("parses free-form goals with apostrophes and multiline URLs", () => {
+    const parsed = parseGoalCommand(
+      "goal",
+      "goal",
+      "Your job is to maybe improve the readme.md to make more reference to the product, look at https://raw.githubusercontent.com/mohak34/opencode-notifier/refs/heads/main/README.md\n\nwhich is another plugin, they explain how to install it, we don't have that",
+    );
+
+    const command = requireParseSuccess(parsed);
+    expect(command.action).toBe("draft");
+    expect(command.objective).toContain("we don't have that");
+    expect(command.objective).toContain("opencode-notifier");
+  });
+
+  test("keeps natural apostrophes in lifecycle command text", () => {
+    const parsed = parseGoalCommand("goal-pause", "goal", "don't continue yet");
+
+    const command = requireParseSuccess(parsed);
+    expect(command.action).toBe("pause");
+    expect(command.reason).toBe("don't continue yet");
   });
 
   test("splits quoted arguments", () => {
@@ -56,16 +89,18 @@ describe("goal command parser", () => {
     if (split.ok === false) throw new Error(split.message);
     expect(split.value).toEqual(["one", "two words", "three words"]);
   });
+
+  test("does not reject unclosed natural quotes", () => {
+    const split = splitCommandLine("don\'t fail \"unfinished thought");
+
+    expect(split.ok).toBe(true);
+    if (split.ok === false) throw new Error(split.message);
+    expect(split.value).toEqual(["don't", "fail", "unfinished thought"]);
+  });
 });
 
 function requireParseSuccess(parsed: ReturnType<typeof parseGoalCommand>) {
   expect(parsed.ok).toBe(true);
   if (parsed.ok === false) throw new Error(parsed.message);
   return parsed.value;
-}
-
-function expectParseFailure(parsed: ReturnType<typeof parseGoalCommand>): string {
-  expect(parsed.ok).toBe(false);
-  if (parsed.ok) throw new Error("expected parse failure");
-  return parsed.message;
 }

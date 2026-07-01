@@ -9,6 +9,19 @@ const ABORT_WORDS = new Set(["abort", "cancel"]);
 const FOCUS_WORDS = new Set(["focus", "switch"]);
 const TWEAK_WORDS = new Set(["tweak", "edit", "revise"]);
 const HELP_WORDS = new Set(["help", "?"]);
+const GOAL_TEXT_FLAGS = new Set(["success", "success-criteria", "constraints", "non-goals", "contract", "verification-contract"]);
+const GOAL_BUDGET_FLAGS = new Set([
+  "max-turns",
+  "max-minutes",
+  "max-duration-ms",
+  "max-tokens",
+  "budget",
+  "cooldown-ms",
+  "min-delay-ms",
+  "no-progress-turns",
+  "no-tool-turns",
+  "no-progress-threshold",
+]);
 
 interface FlagValueRead {
   flag: string;
@@ -26,18 +39,19 @@ export function parseGoalCommand(commandName: string, defaultCommandName: string
   const tokensResult = splitCommandLine(rawArguments);
   if (tokensResult.ok === false) return tokensResult;
   const tokens = tokensResult.value;
+  const normalizedCommandName = normalizeGoalCommandName(commandName, defaultCommandName);
 
-  if (commandName === `${defaultCommandName}-status`) return okCommand("status");
-  if (commandName === `${defaultCommandName}-list`) return okCommand("list");
-  if (commandName === `${defaultCommandName}-pause`) return okCommand("pause", { reason: rawArguments });
-  if (commandName === `${defaultCommandName}-resume`) return okCommand("resume");
-  if (commandName === `${defaultCommandName}-clear`) return okCommand("clear");
-  if (commandName === `${defaultCommandName}-abort`) return okCommand("abort", { reason: rawArguments });
-  if (commandName === `${defaultCommandName}-focus`) return okCommand("focus", { goalId: rawArguments.trim() });
-  if (commandName === `${defaultCommandName}-tweak`) return okCommand("tweak", { objective: rawArguments.trim() });
-  if (commandName === `${defaultCommandName}-confirm`) return okCommand("confirm", { goalId: rawArguments.trim() });
-  if (commandName === `${defaultCommandName}-reject`) return okCommand("reject", { goalId: rawArguments.trim() });
-  if (commandName === `${defaultCommandName}-set`) return parseStart(tokens);
+  if (normalizedCommandName === `${defaultCommandName}-status`) return okCommand("status");
+  if (normalizedCommandName === `${defaultCommandName}-list`) return okCommand("list");
+  if (normalizedCommandName === `${defaultCommandName}-pause`) return okCommand("pause", { reason: rawArguments });
+  if (normalizedCommandName === `${defaultCommandName}-resume`) return okCommand("resume");
+  if (normalizedCommandName === `${defaultCommandName}-clear`) return okCommand("clear");
+  if (normalizedCommandName === `${defaultCommandName}-abort`) return okCommand("abort", { reason: rawArguments });
+  if (normalizedCommandName === `${defaultCommandName}-focus`) return okCommand("focus", { goalId: rawArguments.trim() });
+  if (normalizedCommandName === `${defaultCommandName}-tweak`) return okCommand("tweak", { objective: rawArguments.trim() });
+  if (normalizedCommandName === `${defaultCommandName}-confirm`) return okCommand("confirm", { goalId: rawArguments.trim() });
+  if (normalizedCommandName === `${defaultCommandName}-reject`) return okCommand("reject", { goalId: rawArguments.trim() });
+  if (normalizedCommandName === `${defaultCommandName}-set`) return parseStart(tokens);
 
   if (tokens.length === 0) return okCommand("status");
   const first = tokens[0];
@@ -60,6 +74,18 @@ export function parseGoalCommand(commandName: string, defaultCommandName: string
   return parseDraft(tokens);
 }
 
+export function goalCommandAliases(commandName: string): string[] {
+  return commandName.endsWith("s") ? [] : [`${commandName}s`];
+}
+
+function normalizeGoalCommandName(commandName: string, defaultCommandName: string): string {
+  for (const alias of goalCommandAliases(defaultCommandName)) {
+    if (commandName === alias) return defaultCommandName;
+    if (commandName.startsWith(`${alias}-`)) return `${defaultCommandName}${commandName.slice(alias.length)}`;
+  }
+  return commandName;
+}
+
 function parseDraft(tokens: string[]): OperationResult<ParsedGoalCommand> {
   const parsed = parseGoalDefinition(tokens, "draft");
   if (parsed.ok === false) return parsed;
@@ -80,7 +106,7 @@ function parseGoalDefinition(tokens: string[], action: "draft" | "start"): Opera
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (token === undefined) continue;
-    if (token.startsWith("--") === false) {
+    if (isKnownGoalFlagToken(token) === false) {
       objectiveParts.push(token);
       continue;
     }
@@ -94,15 +120,15 @@ function parseGoalDefinition(tokens: string[], action: "draft" | "start"): Opera
     const budgetFlag = applyKnownBudgetFlag(flag, value, budgetOverrides);
     if (budgetFlag.ok === false) return budgetFlag;
     if (budgetFlag.value) continue;
-    if (flag === "success" || flag === "success-criteria") {
+    if (GOAL_TEXT_FLAGS.has(flag) && (flag === "success" || flag === "success-criteria")) {
       successCriteria = value;
       continue;
     }
-    if (flag === "constraints" || flag === "non-goals") {
+    if (GOAL_TEXT_FLAGS.has(flag) && (flag === "constraints" || flag === "non-goals")) {
       constraints = value;
       continue;
     }
-    if (flag === "contract" || flag === "verification-contract") {
+    if (GOAL_TEXT_FLAGS.has(flag) && (flag === "contract" || flag === "verification-contract")) {
       verificationContract = value;
       continue;
     }
@@ -123,6 +149,14 @@ function parseGoalDefinition(tokens: string[], action: "draft" | "start"): Opera
       budgetOverrides,
     },
   };
+}
+
+function isKnownGoalFlagToken(token: string): boolean {
+  if (token.startsWith("--") === false) return false;
+  const rawFlag = token.slice(2);
+  const equalsIndex = rawFlag.indexOf("=");
+  const flag = equalsIndex >= 0 ? rawFlag.slice(0, equalsIndex) : rawFlag;
+  return GOAL_TEXT_FLAGS.has(flag) || GOAL_BUDGET_FLAGS.has(flag);
 }
 
 function okCommand(action: ParsedGoalCommand["action"], partial?: Partial<ParsedGoalCommand>): OperationResult<ParsedGoalCommand> {
@@ -269,7 +303,7 @@ export function splitCommandLine(input: string): OperationResult<string[]> {
       current += char;
       continue;
     }
-    if (char === "\"" || char === "'") {
+    if ((char === "\"" || char === "'") && (current.length === 0 || current.endsWith("="))) {
       quote = char;
       continue;
     }
@@ -284,7 +318,6 @@ export function splitCommandLine(input: string): OperationResult<string[]> {
   }
 
   if (escaped) current += "\\";
-  if (quote !== undefined) return { ok: false, message: "Unclosed quote in goal command." };
   if (current.length > 0) tokens.push(current);
   return { ok: true, value: tokens };
 }
