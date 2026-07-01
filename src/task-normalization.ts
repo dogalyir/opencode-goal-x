@@ -48,6 +48,7 @@ function normalizeOptionalSubtasks(rawSubtasks: unknown): OperationResult<MaybeU
 
 function taskStatusField(record: UnknownRecord): MaybeUndefined<TaskStatus> {
   const value = record.status;
+  if (value === undefined) return "pending";
   if (value === "pending" || value === "complete" || value === "skipped") return value;
   return undefined;
 }
