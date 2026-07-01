@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createOpencodeClient, type Part } from "@opencode-ai/sdk";
-import type { Hooks, PluginInput } from "@opencode-ai/plugin";
+import { tool, type Hooks, type PluginInput } from "@opencode-ai/plugin";
 import type { ToolContext } from "@opencode-ai/plugin/tool";
 import { focusGoal } from "../src/goal";
 import { createGoalRuntime } from "../src/runtime";
@@ -83,6 +83,17 @@ describe("GoalRuntime integration-style behavior", () => {
     const goal = goalAt(store, 0);
     expect(goal.status).toBe("active");
     expect(goal.audit).toBeUndefined();
+    await setup.runtime.disposeForTest();
+  });
+
+  test("task tool schemas serialize without OpenAI-rejected refs", async () => {
+    const setup = createRuntimeSetup({ requireAudit: false });
+
+    const draftParameters = toolParametersJson(setup.hooks, "propose_goal_draft");
+    const taskParameters = toolParametersJson(setup.hooks, "propose_task_list");
+
+    expectNoSchemaRefs(draftParameters);
+    expectNoSchemaRefs(taskParameters);
     await setup.runtime.disposeForTest();
   });
 
@@ -322,6 +333,17 @@ function requireTool(hooks: Hooks, name: string): NonNullable<NonNullable<Hooks[
   const selected = tools[name];
   if (selected === undefined) throw new Error(`tool missing: ${name}`);
   return selected;
+}
+
+function toolParametersJson(hooks: Hooks, name: string): unknown {
+  return tool.schema.toJSONSchema(tool.schema.object(requireTool(hooks, name).args));
+}
+
+function expectNoSchemaRefs(parameters: unknown): void {
+  const serialized = JSON.stringify(parameters);
+  expect(serialized).not.toContain('"$ref"');
+  expect(serialized).not.toContain('"$defs"');
+  expect(serialized).not.toContain('"definitions"');
 }
 
 async function startImmediateGoal(setup: RuntimeSetup): Promise<void> {

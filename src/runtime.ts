@@ -63,10 +63,10 @@ const TaskInputBaseFields = {
   lightweightSubtasks: tool.schema.boolean().optional(),
 };
 
-const TaskInputSchema: ReturnType<typeof tool.schema.lazy> = tool.schema.lazy(() => tool.schema.object({
+const TaskInputSchema = tool.schema.object({
   ...TaskInputBaseFields,
-  subtasks: tool.schema.array(TaskInputSchema).optional(),
-}));
+  subtasks: tool.schema.array(tool.schema.unknown()).optional(),
+});
 
 const TaskListArgs = {
   tasks: tool.schema.array(TaskInputSchema).min(1),
