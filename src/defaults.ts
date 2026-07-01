@@ -31,6 +31,8 @@ export const DEFAULT_BUDGET: GoalBudget = {
 export const DEFAULT_OPTIONS: GoalRuntimeOptions = {
   commandName: "goal",
   stateDir: DEFAULT_STATE_DIR,
+  planningAgent: "plan",
+  executionAgent: "build",
   ...DEFAULT_BUDGET,
   requireAudit: true,
   auditTimeoutMs: DEFAULT_AUDIT_TIMEOUT_MINUTES * SECONDS_PER_MINUTE * MS_PER_SECOND,

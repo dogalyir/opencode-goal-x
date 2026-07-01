@@ -155,6 +155,8 @@ export const GoalStoreSnapshotSchema: z.ZodType<GoalStoreSnapshot> = z.object({
 const PluginOptionsSchema = z.object({
   commandName: OptionalNonEmptyStringSchema,
   stateDir: OptionalNonEmptyStringSchema,
+  planningAgent: OptionalNonEmptyStringSchema,
+  executionAgent: OptionalNonEmptyStringSchema,
   maxTurns: z.number().int().positive().optional(),
   maxRuntimeMs: z.number().int().positive().optional(),
   maxMinutes: z.number().positive().optional(),
@@ -190,6 +192,8 @@ export function normalizeOptions(rawOptions: unknown): GoalRuntimeOptions {
   return {
     commandName: normalizeCommandName(options.commandName ?? DEFAULT_OPTIONS.commandName),
     stateDir: options.stateDir ?? DEFAULT_OPTIONS.stateDir,
+    planningAgent: options.planningAgent ?? DEFAULT_OPTIONS.planningAgent,
+    executionAgent: options.executionAgent ?? DEFAULT_OPTIONS.executionAgent,
     maxTurns: options.maxTurns ?? DEFAULT_OPTIONS.maxTurns,
     maxRuntimeMs,
     maxTokens: options.maxTokens ?? DEFAULT_OPTIONS.maxTokens,
