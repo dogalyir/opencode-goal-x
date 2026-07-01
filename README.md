@@ -1,8 +1,60 @@
 # opencode-goal-x
 
-opencode-goal-x is an OpenCode plugin for managing persistent AI objectives across sessions. It adds confirmation-first goal drafting, guarded automatic continuations, OpenCode todo synchronization, compact TUI visibility, context preservation, and fail-closed completion audits.
+Goal X is an OpenCode plugin for turning long-running AI work into durable, inspectable goals. It keeps the objective, task list, execution context, audit state, and progress ledger on disk so OpenCode can continue the right work across turns, compaction, and restarted sessions.
 
-Goal X is built directly on OpenCode server-plugin hooks, native sessions, command hooks, compaction hooks, custom tools, state files, and a target-exclusive TUI plugin module.
+Use it when you want OpenCode to keep pursuing a concrete outcome without losing the guardrails: draft-before-start workflows, automatic continuation budgets, native todo synchronization, compact TUI status, and fail-closed completion audits.
+
+## Quick Start
+
+Add the server plugin target to your `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-goal-x/server"]
+}
+```
+
+Restart OpenCode. Plugins are loaded at startup, so running sessions will not see new plugin config until you quit and reopen OpenCode.
+
+Start with a safe draft:
+
+```text
+/goal make the test suite pass and verify it with bun test
+```
+
+Goal X asks the assistant to refine that topic into a proposed goal. No durable goal is created and no implementation should start until the assistant calls `propose_goal_draft` and you confirm it:
+
+```text
+/goal-confirm
+```
+
+If you already know the exact objective and want to start immediately, use `/goal-set` instead:
+
+```text
+/goal-set make the test suite pass and verify it with bun test --max-turns 20
+```
+
+By default, state is stored in `.opencode/goals/` inside the current project. Use `/goal-status`, `/goal-list`, and `/goal-focus` to inspect and manage active work.
+
+## Optional TUI Target
+
+The server plugin target, `opencode-goal-x/server`, owns commands, tools, lifecycle state, auto-continuation, todo sync, and audits. Load this target first for Goal X to work.
+
+The TUI plugin target, `opencode-goal-x/tui`, is optional. Load it through OpenCode's TUI plugin mechanism when you want dashboard/status UI for the same `.opencode/goals/` files. It is target-exclusive and does not replace the server plugin.
+
+## What Goal X Does
+
+- Keeps a persistent goal pool in `.opencode/goals/` with active markdown mirrors, archived markdown files, strict `state.json`, pending drafts, captured execution context, audit progress, and append-only `ledger.jsonl`.
+- Makes `/goal <topic>` safe by default: it starts a draft/planning flow and never creates or executes a goal until explicit `/goal-confirm`.
+- Provides `/goal-set <objective>` as the explicit immediate-start shortcut.
+- Captures active agent/model/provider/variant context and reuses it for plugin-driven continuations, compaction followups, and audits unless explicit auditor config overrides it. Non-default variants such as `xhigh` are preserved by default.
+- Runs guarded auto-continuation from `session.idle`, with budget limits for turns, runtime, tracked tokens, prompt failures, no-tool loops, low-progress loops, and stale focus.
+- Preserves context during compaction through `experimental.session.compacting`, including focused goal, other open goals, task summary, latest audit/pause state, and recent ledger events. Goal X suppresses OpenCode's generic compaction auto-continue when it queues its own continuation.
+- Exposes schema-gated lifecycle tools: `get_goal`, `propose_goal_draft`, `propose_goal_tweak`, `complete_goal`, `pause_goal`, `abort_goal`, `propose_task_list`, `complete_task`, `skip_task`, `audit_goal_completion`, and `report_auditor_progress`.
+- Requires fail-closed completion auditing through a child OpenCode session. Timeouts, API failures, missing markers, contradictory markers, and `<rejected/>` leave the goal open/paused.
+- Observes OpenCode native todos. Representable completed/cancelled todos can update matching goal tasks while goal-specific contracts/evidence remain in Goal X state.
+- Adds optional TUI visibility with a dashboard route, command-palette helpers, prompt/sidebar/app status slots, audit rejection attention, and file-state fallback.
 
 ## Package Targets
 
@@ -12,24 +64,34 @@ This package keeps the default export compatible with existing server-plugin loa
 - `opencode-goal-x/server`: explicit server plugin target.
 - `opencode-goal-x/tui`: TUI plugin target.
 
+Goal X is built directly on OpenCode server-plugin hooks, native sessions, command hooks, compaction hooks, custom tools, state files, and a target-exclusive TUI plugin module.
+
 Current minimum assumed OpenCode/API version: `>=1.17.11` (`@opencode-ai/plugin` and `@opencode-ai/sdk` in this repo). Restart OpenCode after changing plugin code, package exports, or config; plugins are loaded at startup.
 
 Publishing is handled by `.github/workflows/publish.yml` when a GitHub Release is published. The release tag must match `package.json` as `v<version>`.
 
 For the first npm publish, publish once manually, then configure npm Trusted Publishing for `dogalyir/opencode-goal-x`, workflow file `publish.yml`, environment `npm`, with `npm publish` allowed. npm requires the package to exist before a trusted publisher can be attached.
 
-## Features
+## Troubleshooting
 
-- Persistent goal pool in `.opencode/goals/` with active markdown mirrors, archived markdown files, strict `state.json`, pending drafts, captured execution context, audit progress, and append-only `ledger.jsonl`.
-- `/goal <topic>` is safe by default: it starts a draft/planning flow and never creates or executes a goal until explicit `/goal-confirm`.
-- `/goal-set <objective>` is the explicit immediate-start shortcut.
-- Active agent/model/provider/variant capture and forwarding for plugin-driven prompts. Non-default variants such as `xhigh` are preserved by default for continuations, compaction followups, and audits unless explicit auditor config overrides them.
-- AutoContinue loop driven by `session.idle`, with budget guards for turns, runtime, tracked tokens, prompt failures, no-tool loops, low-progress loops, stale focus, and prompt failures.
-- Compaction continuity through `experimental.session.compacting`, with focused goal, other open goals, task summary, latest audit/pause state, and recent ledger events. Goal X suppresses OpenCode's generic compaction auto-continue when it queues its own continuation.
-- Schema-gated lifecycle tools: `get_goal`, `propose_goal_draft`, `propose_goal_tweak`, `complete_goal`, `pause_goal`, `abort_goal`, `propose_task_list`, `complete_task`, `skip_task`, `audit_goal_completion`, and `report_auditor_progress`.
-- Fail-closed completion auditing through a child OpenCode session. Timeouts, API failures, missing markers, contradictory markers, and `<rejected/>` leave the goal open/paused.
-- OpenCode native todo observation. Representable completed/cancelled todos can update matching goal tasks while goal-specific contracts/evidence remain in Goal X state.
-- TUI target with dashboard route, command-palette helpers, prompt/sidebar/app status slots, audit rejection attention, and file-state fallback.
+**Plugin not loading?** Check that `opencode.json` uses the server target in the `plugin` array, then fully quit and restart OpenCode. Config and plugin packages are loaded at startup, not hot-reloaded.
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-goal-x/server"]
+}
+```
+
+**Still seeing old behavior after updating?** OpenCode caches plugin packages under `~/.cache/opencode`. Close OpenCode, clear the cached Goal X package, then reopen OpenCode so it downloads the package again.
+
+```bash
+rm -rf ~/.cache/opencode/packages/opencode-goal-x*
+rm -rf ~/.cache/opencode/node_modules/opencode-goal-x
+rm -f ~/.cache/opencode/bun.lock
+```
+
+**Commands missing?** The server plugin target owns `/goal`, `/goal-set`, lifecycle tools, auto-continuation, todo sync, and audits. Loading only `opencode-goal-x/tui` gives UI visibility for existing state files, but it does not register server commands or tools.
 
 ## Local Development
 
